@@ -1,16 +1,20 @@
 
 import os
 import secrets
+from pathlib import Path
 from datetime import datetime, timezone
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse
 
+APP_VERSION = "1.2.0"
+MIGRATION_VERSION = "001_initial_core"
+
 app = FastAPI(
     title="MASIH GRAM GLOBAL API",
     description="MASIH GRAM GLOBAL ULTIMATE Backend",
-    version="1.1.0"
+    version=APP_VERSION
 )
 
 
@@ -60,10 +64,8 @@ def root():
     return {
         "name": "MASIH GRAM GLOBAL",
         "status": "online",
-        "version": "1.1.0",
-        "server_time": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "version": APP_VERSION,
+        "server_time": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -72,9 +74,7 @@ def health():
     return {
         "status": "healthy",
         "service": "masih-gram-backend",
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -115,10 +115,7 @@ def database_tables(
             rows = cursor.fetchall()
 
     tables = [
-        {
-            "schema": row[0],
-            "name": row[1]
-        }
+        {"schema": row[0], "name": row[1]}
         for row in rows
     ]
 
@@ -130,19 +127,96 @@ def database_tables(
     }
 
 
+@app.post("/api/v1/admin/migrations/apply")
+def apply_initial_migration(
+    x_admin_key: str = Header(default=None)
+):
+    verify_admin_key(x_admin_key)
+
+    migration_file = (
+        Path(__file__).resolve().parent
+        / "001_initial_core.sql"
+    )
+
+    if not migration_file.is_file():
+        raise HTTPException(
+            status_code=500,
+            detail="Migration file was not found"
+        )
+
+    try:
+        sql = migration_file.read_text(encoding="utf-8")
+
+        if not sql.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Migration file is empty"
+            )
+
+        with psycopg.connect(
+            get_database_url(),
+            connect_timeout=15,
+            autocommit=True
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, prepare=False)
+
+                cursor.execute("""
+                    SELECT COUNT(*)
+                    FROM public.mg_schema_migrations
+                    WHERE version = %s
+                """, (MIGRATION_VERSION,))
+
+                applied = cursor.fetchone()[0]
+
+                cursor.execute("""
+                    SELECT COUNT(*)
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_type = 'BASE TABLE'
+                    AND table_name LIKE 'mg\\_%'
+                """)
+
+                table_count = cursor.fetchone()[0]
+
+        if not applied:
+            raise HTTPException(
+                status_code=500,
+                detail="Migration completion could not be verified"
+            )
+
+        return {
+            "status": "success",
+            "migration": MIGRATION_VERSION,
+            "database": "PostgreSQL",
+            "applied": True,
+            "masih_gram_tables": table_count,
+            "message": "MASIH GRAM core migration completed"
+        }
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Migration failed. Check backend logs."
+        )
+
+
 @app.get("/api/v1/system/info")
 def system_info():
     return {
         "application": "MASIH GRAM",
         "edition": "GLOBAL ULTIMATE",
         "api_version": "v1",
+        "backend_version": APP_VERSION,
         "modules": {
-            "authentication": "in_development",
-            "messaging": "planned",
-            "groups": "planned",
-            "channels": "planned",
-            "media": "planned",
-            "social": "planned",
+            "authentication": "core_database_ready",
+            "messaging": "core_database_ready",
+            "groups": "core_database_ready",
+            "channels": "core_database_ready",
+            "media": "core_database_ready",
+            "social": "in_development",
             "ai": "planned",
             "cloud": "planned",
             "live": "planned"
