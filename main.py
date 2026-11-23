@@ -3856,7 +3856,6 @@ def global_discovery_search(
     authorization: Optional[str] = Header(None),
 ):
     user = global_user(authorization)
-    require_global_schema()
 
     limit, offset = discovery_pagination(limit, offset)
     pattern = discovery_search_pattern(q)
@@ -3868,6 +3867,7 @@ def global_discovery_search(
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            require_global_schema(cursor)
 
             if search_type in ("all", "users"):
                 cursor.execute(
@@ -3978,12 +3978,12 @@ def global_discovery_trending(
     authorization: Optional[str] = Header(None),
 ):
     user = global_user(authorization)
-    require_global_schema()
 
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            require_global_schema(cursor)
             cursor.execute(
                 """
                 SELECT
@@ -4057,12 +4057,12 @@ def global_discovery_latest(
     authorization: Optional[str] = Header(None),
 ):
     user = global_user(authorization)
-    require_global_schema()
 
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            require_global_schema(cursor)
             cursor.execute(
                 """
                 SELECT
@@ -4117,12 +4117,12 @@ def global_discovery_creators(
     authorization: Optional[str] = Header(None),
 ):
     user = global_user(authorization)
-    require_global_schema()
 
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            require_global_schema(cursor)
             cursor.execute(
                 """
                 SELECT
@@ -4179,7 +4179,6 @@ def global_discovery_popular(
     authorization: Optional[str] = Header(None),
 ):
     user = global_user(authorization)
-    require_global_schema()
 
     limit, offset = discovery_pagination(limit, offset)
 
@@ -4194,6 +4193,7 @@ def global_discovery_popular(
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            require_global_schema(cursor)
             if interval:
                 cursor.execute(
                     """
