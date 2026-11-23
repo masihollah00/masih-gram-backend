@@ -10421,3 +10421,443 @@ def mg18_clear_history(
 
 
 # END OF SECTION 18
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 19 — SYSTEM CONFIGURATION ENGINE
+# ============================================================
+
+import json as mg19_json
+import re as mg19_re
+from datetime import datetime, timezone
+from typing import Optional
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+MG19_VERSION = "19.0.0"
+MG19_KEY_PATTERN = mg19_re.compile(
+    r"^[a-z][a-z0-9_.-]{1,79}$"
+)
+
+
+class MG19ConfigCreate(BaseModel):
+    key: str = Field(min_length=2, max_length=80)
+    value: object
+    description: str = Field(default="", max_length=300)
+    enabled: bool = True
+
+
+class MG19ConfigUpdate(BaseModel):
+    value: object
+    description: Optional[str] = Field(
+        default=None,
+        max_length=300
+    )
+    enabled: Optional[bool] = None
+
+
+def mg19_admin(authorization):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+    global_admin_check(authorization)
+
+
+def mg19_validate_key(key):
+    if not isinstance(key, str):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid configuration key"
+        )
+
+    key = key.strip().lower()
+
+    if not MG19_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(
+            status_code=422,
+            detail="Configuration key format is invalid"
+        )
+
+    return key
+
+
+def mg19_validate_value(value):
+    try:
+        encoded = mg19_json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Configuration value must be valid JSON"
+        )
+
+    if len(encoded.encode("utf-8")) > 16384:
+        raise HTTPException(
+            status_code=413,
+            detail="Configuration value is too large"
+        )
+
+    return encoded
+
+
+def mg19_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg19_system_configs (
+            config_key VARCHAR(80) PRIMARY KEY,
+            config_value JSONB NOT NULL,
+            description VARCHAR(300) NOT NULL DEFAULT '',
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            revision BIGINT NOT NULL DEFAULT 1,
+            updated_by TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg19_config_history (
+            id BIGSERIAL PRIMARY KEY,
+            config_key VARCHAR(80) NOT NULL,
+            old_value JSONB,
+            new_value JSONB NOT NULL,
+            old_enabled BOOLEAN,
+            new_enabled BOOLEAN NOT NULL,
+            changed_by TEXT,
+            revision BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        mg19_config_history_key_idx
+        ON mg19_config_history(config_key, created_at DESC)
+    """)
+
+
+@app.post("/api/v1/admin/migrations/configuration/apply")
+def mg19_apply_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "SYSTEM CONFIGURATION",
+        "version": MG19_VERSION
+    }
+
+
+@app.post("/api/v1/admin/configuration")
+def mg19_create_config(
+    data: MG19ConfigCreate,
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+
+    key = mg19_validate_key(data.key)
+    encoded = mg19_validate_value(data.value)
+    description = data.description.strip()
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg19_system_configs (
+                    config_key,
+                    config_value,
+                    description,
+                    enabled,
+                    updated_by
+                )
+                VALUES (%s, %s::jsonb, %s, %s, 'admin')
+                ON CONFLICT (config_key) DO NOTHING
+                RETURNING config_key, revision, created_at
+            """, (
+                key,
+                encoded,
+                description,
+                data.enabled
+            ))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=409,
+            detail="Configuration key already exists"
+        )
+
+    return {
+        "success": True,
+        "key": row[0],
+        "revision": row[1],
+        "created_at": row[2].isoformat()
+    }
+
+
+@app.get("/api/v1/configuration")
+def mg19_public_configs():
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT config_key, config_value, revision
+                FROM mg19_system_configs
+                WHERE enabled = TRUE
+                ORDER BY config_key
+            """)
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "items": [
+            {
+                "key": row[0],
+                "value": row[1],
+                "revision": row[2]
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/v1/admin/configuration")
+def mg19_admin_configs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    config_key,
+                    config_value,
+                    description,
+                    enabled,
+                    revision,
+                    updated_by,
+                    created_at,
+                    updated_at
+                FROM mg19_system_configs
+                ORDER BY config_key
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "items": [
+            {
+                "key": row[0],
+                "value": row[1],
+                "description": row[2],
+                "enabled": row[3],
+                "revision": row[4],
+                "updated_by": row[5],
+                "created_at": row[6].isoformat(),
+                "updated_at": row[7].isoformat()
+            }
+            for row in rows
+        ],
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.put("/api/v1/admin/configuration/{config_key}")
+def mg19_update_config(
+    config_key: str,
+    data: MG19ConfigUpdate,
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+
+    key = mg19_validate_key(config_key)
+    encoded = mg19_validate_value(data.value)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT config_value, enabled, revision
+                FROM mg19_system_configs
+                WHERE config_key = %s
+                FOR UPDATE
+            """, (key,))
+
+            old = cursor.fetchone()
+
+            if not old:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Configuration not found"
+                )
+
+            new_enabled = (
+                data.enabled
+                if data.enabled is not None
+                else old[1]
+            )
+
+            new_description = data.description
+
+            if new_description is None:
+                cursor.execute("""
+                    SELECT description
+                    FROM mg19_system_configs
+                    WHERE config_key = %s
+                """, (key,))
+                new_description = cursor.fetchone()[0]
+
+            revision = old[2] + 1
+
+            cursor.execute("""
+                UPDATE mg19_system_configs
+                SET config_value = %s::jsonb,
+                    description = %s,
+                    enabled = %s,
+                    revision = %s,
+                    updated_by = 'admin',
+                    updated_at = NOW()
+                WHERE config_key = %s
+            """, (
+                encoded,
+                new_description,
+                new_enabled,
+                revision,
+                key
+            ))
+
+            cursor.execute("""
+                INSERT INTO mg19_config_history (
+                    config_key,
+                    old_value,
+                    new_value,
+                    old_enabled,
+                    new_enabled,
+                    changed_by,
+                    revision
+                )
+                VALUES (
+                    %s, %s::jsonb, %s::jsonb,
+                    %s, %s, 'admin', %s
+                )
+            """, (
+                key,
+                mg19_json.dumps(old[0], ensure_ascii=False),
+                encoded,
+                old[1],
+                new_enabled,
+                revision
+            ))
+
+    return {
+        "success": True,
+        "key": key,
+        "revision": revision,
+        "enabled": new_enabled
+    }
+
+
+@app.get("/api/v1/admin/configuration/{config_key}/history")
+def mg19_config_history(
+    config_key: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+    key = mg19_validate_key(config_key)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    id,
+                    old_value,
+                    new_value,
+                    old_enabled,
+                    new_enabled,
+                    revision,
+                    created_at
+                FROM mg19_config_history
+                WHERE config_key = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+            """, (key, limit))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "key": key,
+        "items": [
+            {
+                "id": row[0],
+                "old_value": row[1],
+                "new_value": row[2],
+                "old_enabled": row[3],
+                "new_enabled": row[4],
+                "revision": row[5],
+                "created_at": row[6].isoformat()
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.delete("/api/v1/admin/configuration/{config_key}")
+def mg19_delete_config(
+    config_key: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    mg19_admin(authorization)
+    key = mg19_validate_key(config_key)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg19_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg19_system_configs
+                WHERE config_key = %s
+                RETURNING config_key
+            """, (key,))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Configuration not found"
+        )
+
+    return {
+        "success": True,
+        "deleted_key": row[0]
+    }
+
+
+# END OF SECTION 19
