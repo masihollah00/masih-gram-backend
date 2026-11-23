@@ -10043,3 +10043,381 @@ def mg17_verify_key(
 
 
 # END OF SECTION 17
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 18 — SYSTEM HEALTH & DIAGNOSTICS ENGINE
+# ============================================================
+
+import time as mg18_time
+import uuid as mg18_uuid
+import json as mg18_json
+from datetime import datetime, timezone
+from typing import Optional
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+MG18_VERSION = "18.0.0"
+MG18_HISTORY_LIMIT = 5000
+
+
+class MG18DiagnosticEvent(BaseModel):
+    component: str = Field(min_length=2, max_length=80)
+    severity: str = Field(default="info")
+    message: str = Field(min_length=1, max_length=500)
+
+
+def mg18_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg18_health_history (
+            id BIGSERIAL PRIMARY KEY,
+            check_id UUID NOT NULL UNIQUE,
+            component VARCHAR(80) NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            response_ms DOUBLE PRECISION,
+            message TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        mg18_health_history_created_idx
+        ON mg18_health_history(created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        mg18_health_history_component_idx
+        ON mg18_health_history(component, created_at DESC)
+    """)
+
+
+def mg18_record(cursor, component, status, response_ms, message):
+    cursor.execute("""
+        INSERT INTO mg18_health_history (
+            check_id,
+            component,
+            status,
+            response_ms,
+            message
+        )
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id, created_at
+    """, (
+        str(mg18_uuid.uuid4()),
+        component,
+        status,
+        response_ms,
+        message
+    ))
+
+    return cursor.fetchone()
+
+
+def mg18_admin(authorization):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+
+    # Uses the project's existing admin authorization.
+    global_admin_check(authorization)
+
+
+@app.get("/api/v1/system/health")
+def mg18_health():
+    started = mg18_time.perf_counter()
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                database_ok = cursor.fetchone()[0] == 1
+
+                cursor.execute("""
+                    SELECT pg_database_size(current_database())
+                """)
+                database_size = cursor.fetchone()[0]
+
+        elapsed = (
+            mg18_time.perf_counter() - started
+        ) * 1000
+
+        return {
+            "success": True,
+            "service": "MASIH GRAM",
+            "version": MG18_VERSION,
+            "status": "healthy" if database_ok else "degraded",
+            "database": {
+                "status": "connected",
+                "response_ms": round(elapsed, 3),
+                "size_bytes": database_size
+            },
+            "checked_at": datetime.now(
+                timezone.utc
+            ).isoformat()
+        }
+
+    except Exception:
+        return {
+            "success": False,
+            "service": "MASIH GRAM",
+            "version": MG18_VERSION,
+            "status": "unhealthy",
+            "database": {
+                "status": "unavailable"
+            },
+            "checked_at": datetime.now(
+                timezone.utc
+            ).isoformat()
+        }
+
+
+@app.get("/api/v1/system/health/database")
+def mg18_database_health():
+    started = mg18_time.perf_counter()
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT
+                        current_database(),
+                        current_user,
+                        pg_database_size(current_database()),
+                        NOW()
+                """)
+
+                row = cursor.fetchone()
+
+        elapsed = (
+            mg18_time.perf_counter() - started
+        ) * 1000
+
+        return {
+            "success": True,
+            "database": row[0],
+            "database_user": row[1],
+            "size_bytes": row[2],
+            "server_time": row[3].isoformat(),
+            "response_ms": round(elapsed, 3),
+            "status": "connected"
+        }
+
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Database health check failed"
+        )
+
+
+@app.post("/api/v1/admin/migrations/system-health/apply")
+def mg18_apply_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    mg18_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg18_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "SYSTEM HEALTH",
+        "version": MG18_VERSION
+    }
+
+
+@app.post("/api/v1/admin/system-health/events")
+def mg18_create_event(
+    data: MG18DiagnosticEvent,
+    authorization: Optional[str] = Header(default=None)
+):
+    mg18_admin(authorization)
+
+    if data.severity not in (
+        "info", "warning", "error", "critical"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid severity"
+        )
+
+    component = data.component.strip()
+    message = data.message.strip()
+
+    if not component or not message:
+        raise HTTPException(
+            status_code=422,
+            detail="Component and message are required"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg18_require_schema(cursor)
+
+            row = mg18_record(
+                cursor,
+                component,
+                data.severity,
+                None,
+                message
+            )
+
+    return {
+        "success": True,
+        "event_id": row[0],
+        "created_at": row[1].isoformat()
+    }
+
+
+@app.get("/api/v1/admin/system-health/history")
+def mg18_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    component: Optional[str] = Query(default=None),
+    authorization: Optional[str] = Header(default=None)
+):
+    mg18_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg18_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    id,
+                    check_id,
+                    component,
+                    status,
+                    response_ms,
+                    message,
+                    created_at
+                FROM mg18_health_history
+                WHERE (%s IS NULL OR component = %s)
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s OFFSET %s
+            """, (
+                component,
+                component,
+                limit,
+                offset
+            ))
+
+            rows = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM mg18_health_history
+                WHERE (%s IS NULL OR component = %s)
+            """, (component, component))
+
+            total = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "id": row[0],
+                "check_id": str(row[1]),
+                "component": row[2],
+                "status": row[3],
+                "response_ms": row[4],
+                "message": row[5],
+                "created_at": (
+                    row[6].isoformat() if row[6] else None
+                )
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/v1/admin/system-health/statistics")
+def mg18_statistics(
+    authorization: Optional[str] = Header(default=None)
+):
+    mg18_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg18_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*),
+                    COUNT(*) FILTER (WHERE status = 'error'),
+                    COUNT(*) FILTER (WHERE status = 'warning'),
+                    COUNT(*) FILTER (WHERE status = 'critical'),
+                    AVG(response_ms)
+                FROM mg18_health_history
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+            """)
+
+            row = cursor.fetchone()
+
+            cursor.execute("""
+                SELECT component, COUNT(*)
+                FROM mg18_health_history
+                WHERE created_at >= NOW() - INTERVAL '24 hours'
+                GROUP BY component
+                ORDER BY COUNT(*) DESC
+                LIMIT 20
+            """)
+
+            components = cursor.fetchall()
+
+    return {
+        "success": True,
+        "period": "24_hours",
+        "total_events": row[0],
+        "errors": row[1],
+        "warnings": row[2],
+        "critical": row[3],
+        "average_response_ms": (
+            round(float(row[4]), 3)
+            if row[4] is not None else None
+        ),
+        "components": [
+            {
+                "name": item[0],
+                "events": item[1]
+            }
+            for item in components
+        ]
+    }
+
+
+@app.delete("/api/v1/admin/system-health/history")
+def mg18_clear_history(
+    keep_days: int = Query(default=30, ge=1, le=3650),
+    authorization: Optional[str] = Header(default=None)
+):
+    mg18_admin(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg18_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg18_health_history
+                WHERE created_at <
+                    NOW() - (%s * INTERVAL '1 day')
+            """, (keep_days,))
+
+            deleted = cursor.rowcount
+
+    return {
+        "success": True,
+        "deleted_records": deleted,
+        "retained_days": keep_days
+    }
+
+
+# END OF SECTION 18
