@@ -11670,3 +11670,372 @@ def mg21_admin_history(
 # ============================================================
 # END OF SECTION 21
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL — SECTION 22
+# GLOBAL RELEASE & VERSION CONTROL
+# ============================================================
+
+import uuid as mg22_uuid
+import re as mg22_re
+from typing import Optional
+
+from fastapi import Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+
+MG22_PLATFORMS = {"android", "ios"}
+MG22_STATUSES = {"draft", "published", "paused", "archived"}
+
+
+# -------------------- MODELS --------------------
+
+class MG22ReleaseCreate(BaseModel):
+    platform: str
+    version: str = Field(..., min_length=1, max_length=40)
+    build_number: int = Field(..., ge=1)
+    minimum_version: str = Field(..., min_length=1, max_length=40)
+    force_update: bool = False
+    download_url: Optional[str] = Field(default=None, max_length=2048)
+    changelog: str = Field(default="", max_length=12000)
+
+
+class MG22ReleaseStatus(BaseModel):
+    status: str
+
+
+# -------------------- VALIDATION --------------------
+
+def mg22_valid_version(value):
+    if not isinstance(value, str):
+        return False
+    return bool(mg22_re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", value.strip()))
+
+
+def mg22_version_tuple(value):
+    if not mg22_valid_version(value):
+        raise HTTPException(status_code=422, detail="Invalid version format")
+    return tuple(int(part) for part in value.strip().split("."))
+
+
+def mg22_validate_release(data):
+    if data.platform not in MG22_PLATFORMS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    if not mg22_valid_version(data.version):
+        raise HTTPException(status_code=422, detail="Invalid version")
+
+    if not mg22_valid_version(data.minimum_version):
+        raise HTTPException(status_code=422, detail="Invalid minimum version")
+
+    if mg22_version_tuple(data.minimum_version) > mg22_version_tuple(data.version):
+        raise HTTPException(
+            status_code=422,
+            detail="Minimum version cannot exceed release version"
+        )
+
+    if data.download_url:
+        if not data.download_url.startswith("https://"):
+            raise HTTPException(
+                status_code=422,
+                detail="Download URL must use HTTPS"
+            )
+
+
+def mg22_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg22_releases (
+            id UUID PRIMARY KEY,
+            platform VARCHAR(20) NOT NULL
+                CHECK (platform IN ('android', 'ios')),
+            version VARCHAR(40) NOT NULL,
+            build_number INTEGER NOT NULL CHECK (build_number >= 1),
+            minimum_version VARCHAR(40) NOT NULL,
+            force_update BOOLEAN NOT NULL DEFAULT FALSE,
+            download_url TEXT NULL,
+            changelog TEXT NOT NULL DEFAULT '',
+            status VARCHAR(20) NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'published', 'paused', 'archived')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            published_at TIMESTAMPTZ NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (platform, version, build_number)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg22_releases_public_idx
+        ON mg22_releases (platform, status, published_at DESC)
+    """)
+
+
+def mg22_row(cursor, row):
+    if row is None:
+        return None
+    return dict(zip(
+        [column.name for column in cursor.description],
+        row
+    ))
+
+
+def mg22_require_admin(api_key):
+    global_admin_check(api_key)
+
+
+# -------------------- MIGRATION --------------------
+
+@app.post("/api/v1/admin/migrations/releases/apply")
+def mg22_apply_migration(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg22_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+    return {
+        "success": True,
+        "module": "release_control",
+        "version": "22.0"
+    }
+
+
+# -------------------- CREATE RELEASE --------------------
+
+@app.post("/api/v1/admin/releases")
+def mg22_create_release(
+    data: MG22ReleaseCreate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg22_require_admin(x_admin_api_key)
+    mg22_validate_release(data)
+
+    release_id = mg22_uuid.uuid4()
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg22_releases (
+                    id, platform, version, build_number,
+                    minimum_version, force_update,
+                    download_url, changelog, status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'draft')
+                RETURNING id, platform, version, build_number,
+                          minimum_version, force_update,
+                          download_url, changelog, status,
+                          created_at, published_at, updated_at
+            """, (
+                release_id,
+                data.platform,
+                data.version.strip(),
+                data.build_number,
+                data.minimum_version.strip(),
+                data.force_update,
+                data.download_url,
+                data.changelog.strip()
+            ))
+
+            result = mg22_row(cursor, cursor.fetchone())
+
+    return {"success": True, "release": result}
+
+
+# -------------------- ADMIN LIST --------------------
+
+@app.get("/api/v1/admin/releases")
+def mg22_admin_list(
+    platform: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg22_require_admin(x_admin_api_key)
+
+    if platform is not None and platform not in MG22_PLATFORMS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    if status is not None and status not in MG22_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid status")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+            conditions = []
+            values = []
+
+            if platform is not None:
+                conditions.append("platform = %s")
+                values.append(platform)
+
+            if status is not None:
+                conditions.append("status = %s")
+                values.append(status)
+
+            where = ""
+            if conditions:
+                where = "WHERE " + " AND ".join(conditions)
+
+            values.extend([limit, offset])
+
+            cursor.execute("""
+                SELECT id, platform, version, build_number,
+                       minimum_version, force_update,
+                       download_url, changelog, status,
+                       created_at, published_at, updated_at
+                FROM mg22_releases
+            """ + where + """
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, tuple(values))
+
+            rows = [
+                mg22_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# -------------------- CHANGE STATUS --------------------
+
+@app.patch("/api/v1/admin/releases/{release_id}/status")
+def mg22_change_status(
+    release_id: str,
+    data: MG22ReleaseStatus,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg22_require_admin(x_admin_api_key)
+
+    if data.status not in MG22_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid status")
+
+    try:
+        parsed_id = mg22_uuid.UUID(release_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid release ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg22_releases
+                SET status = %s,
+                    published_at = CASE
+                        WHEN %s = 'published' THEN NOW()
+                        ELSE published_at
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, platform, version, build_number,
+                          minimum_version, force_update,
+                          download_url, status, published_at, updated_at
+            """, (data.status, data.status, parsed_id))
+
+            result = mg22_row(cursor, cursor.fetchone())
+
+            if result is None:
+                raise HTTPException(status_code=404, detail="Release not found")
+
+    return {"success": True, "release": result}
+
+
+# -------------------- PUBLIC LATEST RELEASE --------------------
+
+@app.get("/api/v1/releases/latest")
+def mg22_latest_release(
+    platform: str = Query(...),
+    installed_version: str = Query(...)
+):
+    if platform not in MG22_PLATFORMS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    if not mg22_valid_version(installed_version):
+        raise HTTPException(status_code=422, detail="Invalid installed version")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, platform, version, build_number,
+                       minimum_version, force_update,
+                       download_url, changelog, published_at
+                FROM mg22_releases
+                WHERE platform = %s
+                  AND status = 'published'
+                ORDER BY published_at DESC NULLS LAST,
+                         created_at DESC
+                LIMIT 1
+            """, (platform,))
+
+            latest = mg22_row(cursor, cursor.fetchone())
+
+    if latest is None:
+        return {
+            "success": True,
+            "update_available": False,
+            "release": None
+        }
+
+    installed = mg22_version_tuple(installed_version)
+    latest_version = mg22_version_tuple(latest["version"])
+    minimum = mg22_version_tuple(latest["minimum_version"])
+
+    update_available = installed < latest_version
+    force_update = installed < minimum
+
+    return {
+        "success": True,
+        "update_available": update_available,
+        "force_update": force_update,
+        "release": latest
+    }
+
+
+# -------------------- ARCHIVE RELEASE --------------------
+
+@app.delete("/api/v1/admin/releases/{release_id}")
+def mg22_archive_release(
+    release_id: str,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg22_require_admin(x_admin_api_key)
+
+    try:
+        parsed_id = mg22_uuid.UUID(release_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid release ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg22_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg22_releases
+                SET status = 'archived', updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, platform, version, status, updated_at
+            """, (parsed_id,))
+
+            result = mg22_row(cursor, cursor.fetchone())
+
+            if result is None:
+                raise HTTPException(status_code=404, detail="Release not found")
+
+    return {"success": True, "release": result}
+
+
+# ============================================================
+# END OF SECTION 22
+# ============================================================
