@@ -11325,3 +11325,348 @@ def mg20_delete_announcement(
 # ============================================================
 # END OF SECTION 20
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL — SECTION 21
+# MAINTENANCE CONTROL CENTER
+# ============================================================
+
+import uuid as mg21_uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import Header, HTTPException
+from pydantic import BaseModel, Field
+
+
+MG21_PLATFORMS = {"all", "android", "ios"}
+
+
+# -------------------- MODELS --------------------
+
+class MG21MaintenanceUpdate(BaseModel):
+    enabled: bool
+    title: str = Field(default="تعمیرات سیستم", min_length=2, max_length=150)
+    message: str = Field(default="سرویس موقتاً در حال به‌روزرسانی است.", min_length=2, max_length=5000)
+    platform: str = Field(default="all", max_length=20)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+
+
+# -------------------- HELPERS --------------------
+
+def mg21_require_admin(api_key):
+    global_admin_check(api_key)
+
+
+def mg21_validate(data):
+    if data.platform not in MG21_PLATFORMS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    if data.starts_at and data.ends_at:
+        start = data.starts_at
+        end = data.ends_at
+
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        if end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail="ends_at must be later than starts_at"
+            )
+
+
+def mg21_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg21_maintenance (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            title VARCHAR(150) NOT NULL,
+            message TEXT NOT NULL,
+            platform VARCHAR(20) NOT NULL DEFAULT 'all',
+            starts_at TIMESTAMPTZ NULL,
+            ends_at TIMESTAMPTZ NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_by VARCHAR(120) NULL,
+            CHECK (platform IN ('all', 'android', 'ios')),
+            CHECK (
+                ends_at IS NULL
+                OR starts_at IS NULL
+                OR ends_at > starts_at
+            )
+        )
+    """)
+
+    cursor.execute("""
+        INSERT INTO mg21_maintenance (
+            id, enabled, title, message, platform
+        )
+        VALUES (
+            1, FALSE, 'تعمیرات سیستم',
+            'سرویس در وضعیت عادی قرار دارد.', 'all'
+        )
+        ON CONFLICT (id) DO NOTHING
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg21_maintenance_history (
+            id UUID PRIMARY KEY,
+            enabled BOOLEAN NOT NULL,
+            title VARCHAR(150) NOT NULL,
+            message TEXT NOT NULL,
+            platform VARCHAR(20) NOT NULL,
+            starts_at TIMESTAMPTZ NULL,
+            ends_at TIMESTAMPTZ NULL,
+            changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            changed_by VARCHAR(120) NULL
+        )
+    """)
+
+
+def mg21_row(cursor, row):
+    if row is None:
+        return None
+    return dict(zip(
+        [column.name for column in cursor.description],
+        row
+    ))
+
+
+def mg21_is_active(row):
+    if not row or not row["enabled"]:
+        return False
+
+    now = datetime.now(timezone.utc)
+    start = row["starts_at"]
+    end = row["ends_at"]
+
+    if start is not None:
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if now < start:
+            return False
+
+    if end is not None:
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if now >= end:
+            return False
+
+    return True
+
+
+# -------------------- MIGRATION --------------------
+
+@app.post("/api/v1/admin/migrations/maintenance/apply")
+def mg21_apply_migration(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg21_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg21_require_schema(cursor)
+
+    return {
+        "success": True,
+        "module": "maintenance_control",
+        "version": "21.0"
+    }
+
+
+# -------------------- ADMIN READ --------------------
+
+@app.get("/api/v1/admin/maintenance")
+def mg21_admin_get(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg21_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg21_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, enabled, title, message, platform,
+                       starts_at, ends_at, updated_at, updated_by
+                FROM mg21_maintenance
+                WHERE id = 1
+            """)
+
+            result = mg21_row(cursor, cursor.fetchone())
+
+    result["currently_active"] = mg21_is_active(result)
+
+    return {"success": True, "maintenance": result}
+
+
+# -------------------- ADMIN UPDATE --------------------
+
+@app.put("/api/v1/admin/maintenance")
+def mg21_admin_update(
+    data: MG21MaintenanceUpdate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg21_require_admin(x_admin_api_key)
+    mg21_validate(data)
+
+    title = data.title.strip()
+    message = data.message.strip()
+
+    if not title or not message:
+        raise HTTPException(status_code=422, detail="Empty title or message")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg21_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT enabled, title, message, platform,
+                       starts_at, ends_at
+                FROM mg21_maintenance
+                WHERE id = 1
+                FOR UPDATE
+            """)
+
+            previous = cursor.fetchone()
+
+            cursor.execute("""
+                UPDATE mg21_maintenance
+                SET enabled = %s,
+                    title = %s,
+                    message = %s,
+                    platform = %s,
+                    starts_at = %s,
+                    ends_at = %s,
+                    updated_at = NOW(),
+                    updated_by = 'admin'
+                WHERE id = 1
+                RETURNING id, enabled, title, message, platform,
+                          starts_at, ends_at, updated_at
+            """, (
+                data.enabled,
+                title,
+                message,
+                data.platform,
+                data.starts_at,
+                data.ends_at
+            ))
+
+            result = mg21_row(cursor, cursor.fetchone())
+
+            cursor.execute("""
+                INSERT INTO mg21_maintenance_history (
+                    id, enabled, title, message, platform,
+                    starts_at, ends_at, changed_by
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'admin')
+            """, (
+                mg21_uuid.uuid4(),
+                data.enabled,
+                title,
+                message,
+                data.platform,
+                data.starts_at,
+                data.ends_at
+            ))
+
+    result["currently_active"] = mg21_is_active(result)
+
+    return {
+        "success": True,
+        "maintenance": result
+    }
+
+
+# -------------------- PUBLIC STATUS --------------------
+
+@app.get("/api/v1/system/maintenance")
+def mg21_public_status(
+    platform: str = "all"
+):
+    if platform not in MG21_PLATFORMS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg21_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT enabled, title, message, platform,
+                       starts_at, ends_at, updated_at
+                FROM mg21_maintenance
+                WHERE id = 1
+            """)
+
+            result = mg21_row(cursor, cursor.fetchone())
+
+    active = mg21_is_active(result)
+
+    platform_matches = (
+        result["platform"] == "all"
+        or platform == "all"
+        or result["platform"] == platform
+    )
+
+    visible = active and platform_matches
+
+    return {
+        "success": True,
+        "maintenance": {
+            "active": visible,
+            "title": result["title"] if visible else None,
+            "message": result["message"] if visible else None,
+            "starts_at": result["starts_at"] if visible else None,
+            "ends_at": result["ends_at"] if visible else None,
+            "updated_at": result["updated_at"]
+        }
+    }
+
+
+# -------------------- ADMIN HISTORY --------------------
+
+@app.get("/api/v1/admin/maintenance/history")
+def mg21_admin_history(
+    limit: int = 50,
+    offset: int = 0,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg21_require_admin(x_admin_api_key)
+
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=422, detail="Invalid limit")
+
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid offset")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg21_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, enabled, title, message, platform,
+                       starts_at, ends_at, changed_at, changed_by
+                FROM mg21_maintenance_history
+                ORDER BY changed_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+
+            rows = [
+                mg21_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# ============================================================
+# END OF SECTION 21
+# ============================================================
