@@ -1016,3 +1016,371 @@ async def not_found_handler(request, exc):
             "error": "Endpoint not found"
         }
     )
+    # =========================================================
+# MASIH GRAM GLOBAL — GOD EDITION
+# MODULE 01: GLOBAL SOCIAL DATABASE AND MODELS
+# =========================================================
+
+from pydantic import ConfigDict
+from typing import List, Dict, Any
+
+
+GLOBAL_MODULE_VERSION = "3.0.0"
+GLOBAL_SCHEMA_VERSION = "003_global_social"
+
+
+# ---------------------------------------------------------
+# REQUEST MODELS
+# ---------------------------------------------------------
+
+class GlobalPostCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+    visibility: str = Field(default="public")
+    media_url: Optional[str] = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalCommentCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=3000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalProfileUpdate(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=100)
+    bio: Optional[str] = Field(default=None, max_length=1000)
+    avatar_url: Optional[str] = Field(default=None, max_length=2000)
+    cover_url: Optional[str] = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalFeatureRequest(BaseModel):
+    feature_code: str = Field(min_length=2, max_length=80)
+    message: Optional[str] = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalFeatureReview(BaseModel):
+    status: str = Field(pattern="^(approved|rejected)$")
+    admin_note: Optional[str] = Field(default=None, max_length=2000)
+    activate: bool = True
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalFeatureCreate(BaseModel):
+    code: str = Field(min_length=2, max_length=80)
+    name: str = Field(min_length=2, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    category: str = Field(default="general", max_length=80)
+    enabled: bool = True
+    requires_review: bool = True
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GlobalFollowRequest(BaseModel):
+    user_id: uuid.UUID
+
+
+class GlobalReportCreate(BaseModel):
+    target_type: str = Field(pattern="^(post|comment|user)$")
+    target_id: uuid.UUID
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class GlobalNotificationRead(BaseModel):
+    notification_ids: List[uuid.UUID] = Field(max_length=100)
+
+
+# ---------------------------------------------------------
+# GLOBAL DATABASE SCHEMA
+# ---------------------------------------------------------
+
+GLOBAL_SCHEMA_STATEMENTS = [
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_social_posts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    content TEXT NOT NULL,
+    media_url TEXT,
+    visibility VARCHAR(20) NOT NULL DEFAULT 'public',
+    likes_count INTEGER NOT NULL DEFAULT 0,
+    comments_count INTEGER NOT NULL DEFAULT 0,
+    views_count BIGINT NOT NULL DEFAULT 0,
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT mg_social_posts_visibility_check
+        CHECK (visibility IN ('public','followers','private'))
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_social_posts_created
+ON public.mg_social_posts(created_at DESC)
+WHERE is_deleted = FALSE
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_social_posts_user
+ON public.mg_social_posts(user_id, created_at DESC)
+WHERE is_deleted = FALSE
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_social_comments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    post_id UUID NOT NULL REFERENCES public.mg_social_posts(id),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    parent_id UUID REFERENCES public.mg_social_comments(id),
+    content TEXT NOT NULL,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_social_comments_post
+ON public.mg_social_comments(post_id, created_at)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_social_likes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    post_id UUID NOT NULL REFERENCES public.mg_social_posts(id),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(post_id, user_id)
+)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_social_follows (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    follower_id UUID NOT NULL REFERENCES public.mg_users(id),
+    following_id UUID NOT NULL REFERENCES public.mg_users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(follower_id, following_id),
+    CHECK(follower_id <> following_id)
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_social_follows_following
+ON public.mg_social_follows(following_id)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_feature_catalog (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(80) NOT NULL UNIQUE,
+    name VARCHAR(120) NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    category VARCHAR(80) NOT NULL DEFAULT 'general',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    requires_review BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_feature_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    feature_id UUID NOT NULL REFERENCES public.mg_feature_catalog(id),
+    message TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    admin_note TEXT,
+    reviewed_by UUID REFERENCES public.mg_users(id),
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK(status IN ('pending','approved','rejected'))
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_feature_requests_status
+ON public.mg_feature_requests(status, created_at DESC)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_user_feature_entitlements (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    feature_id UUID NOT NULL REFERENCES public.mg_feature_catalog(id),
+    granted_by UUID REFERENCES public.mg_users(id),
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE(user_id, feature_id)
+)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_creator_badges (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL UNIQUE REFERENCES public.mg_users(id),
+    badge_name VARCHAR(120) NOT NULL DEFAULT 'سازنده MASIH GRAM',
+    granted_by UUID REFERENCES public.mg_users(id),
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at TIMESTAMPTZ
+)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_social_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reporter_id UUID NOT NULL REFERENCES public.mg_users(id),
+    target_type VARCHAR(20) NOT NULL,
+    target_id UUID NOT NULL,
+    reason TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    reviewed_by UUID REFERENCES public.mg_users(id),
+    admin_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ,
+    CHECK(target_type IN ('post','comment','user')),
+    CHECK(status IN ('pending','reviewed','dismissed'))
+)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_global_notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES public.mg_users(id),
+    actor_id UUID REFERENCES public.mg_users(id),
+    notification_type VARCHAR(60) NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    reference_type VARCHAR(40),
+    reference_id UUID,
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_global_notifications_user
+ON public.mg_global_notifications(user_id, created_at DESC)
+""",
+
+"""
+CREATE TABLE IF NOT EXISTS public.mg_global_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id UUID REFERENCES public.mg_users(id),
+    action VARCHAR(120) NOT NULL,
+    target_type VARCHAR(80),
+    target_id UUID,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+""",
+
+"""
+CREATE INDEX IF NOT EXISTS idx_mg_global_audit_created
+ON public.mg_global_audit(created_at DESC)
+""",
+
+"""
+INSERT INTO public.mg_feature_catalog
+(code, name, description, category, enabled, requires_review)
+VALUES
+('social_feed','شبکه اجتماعی','انتشار و مشاهده پست‌ها','social',TRUE,FALSE),
+('post_likes','لایک پست‌ها','ثبت و حذف پسندیدن پست','social',TRUE,FALSE),
+('post_comments','دیدگاه‌ها','ثبت و مدیریت دیدگاه‌ها','social',TRUE,FALSE),
+('user_follow','دنبال‌کردن','دنبال‌کردن و لغو دنبال‌کردن کاربران','social',TRUE,FALSE),
+('creator_badge','نشان سازنده','نشان رسمی سازنده برنامه','identity',TRUE,TRUE),
+('advanced_profile','پروفایل پیشرفته','امکانات تکمیلی پروفایل','profile',TRUE,TRUE),
+('custom_themes','پوسته‌های اختصاصی','فعال‌سازی پوسته‌های حساب','appearance',TRUE,TRUE),
+('advanced_privacy','حریم خصوصی پیشرفته','تنظیمات تکمیلی حریم خصوصی','security',TRUE,TRUE),
+('priority_support','پشتیبانی ویژه','دسترسی به مسیر پشتیبانی ویژه','support',TRUE,TRUE)
+ON CONFLICT(code) DO NOTHING
+"""
+]
+
+
+# ---------------------------------------------------------
+# GLOBAL SCHEMA INITIALIZATION
+# ---------------------------------------------------------
+
+def require_global_schema(cursor):
+    cursor.execute("""
+        SELECT
+            to_regclass('public.mg_social_posts'),
+            to_regclass('public.mg_social_comments'),
+            to_regclass('public.mg_social_likes'),
+            to_regclass('public.mg_feature_catalog'),
+            to_regclass('public.mg_feature_requests'),
+            to_regclass('public.mg_user_feature_entitlements'),
+            to_regclass('public.mg_creator_badges'),
+            to_regclass('public.mg_global_notifications')
+    """)
+    row = cursor.fetchone()
+
+    if not row or not all(row):
+        raise HTTPException(
+            status_code=503,
+            detail="GLOBAL database migration is not installed"
+        )
+
+
+def global_user(authorization):
+    return get_authenticated_user(authorization)
+
+
+def global_audit(cursor, actor_id, action,
+                 target_type=None, target_id=None, details=None):
+    cursor.execute("""
+        INSERT INTO public.mg_global_audit (
+            actor_id, action, target_type, target_id, details
+        )
+        VALUES (%s, %s, %s, %s, %s::jsonb)
+    """, (
+        actor_id,
+        action,
+        target_type,
+        target_id,
+        json.dumps(details or {}, ensure_ascii=False)
+    ))
+
+
+def create_global_notification(
+    cursor,
+    user_id,
+    notification_type,
+    title,
+    body="",
+    actor_id=None,
+    reference_type=None,
+    reference_id=None
+):
+    cursor.execute("""
+        INSERT INTO public.mg_global_notifications (
+            user_id, actor_id, notification_type, title, body,
+            reference_type, reference_id
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        user_id,
+        actor_id,
+        notification_type,
+        title,
+        body,
+        reference_type,
+        reference_id
+    ))
+
+
+# =========================================================
+# END MODULE 01
+# NEXT: GLOBAL MIGRATION + SOCIAL API
+# =========================================================
