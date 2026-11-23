@@ -2503,3 +2503,731 @@ def admin_revoke_creator_badge(
 # END MODULE 03
 # NEXT: FEATURE STORE + ADMIN CONTROL CENTER
 # =========================================================
+# =========================================================
+# MASIH GRAM GLOBAL — SECTION 4
+# FEATURE STORE + REQUEST CENTER + ADMIN ACTIVATION
+# =========================================================
+
+from datetime import timedelta
+
+
+def global_admin_check(x_admin_key: Optional[str]):
+    """اعتبارسنجی کلید مدیریت با سیستم امنیتی اصلی برنامه."""
+    verify_admin_key(x_admin_key)
+
+
+def global_feature_dict(row):
+    return {
+        "code": row[0],
+        "name": row[1],
+        "description": row[2],
+        "category": row[3],
+        "enabled": bool(row[4]),
+        "requires_review": bool(row[5]),
+        "created_at": row[6].isoformat() if row[6] else None
+    }
+
+
+def global_feature_request_dict(row):
+    return {
+        "id": str(row[0]),
+        "feature_code": row[1],
+        "feature_name": row[2],
+        "message": row[3],
+        "status": row[4],
+        "admin_note": row[5],
+        "created_at": row[6].isoformat() if row[6] else None,
+        "reviewed_at": row[7].isoformat() if row[7] else None
+    }
+
+
+def global_entitlement_dict(row):
+    return {
+        "feature_code": row[0],
+        "feature_name": row[1],
+        "activated_at": row[2].isoformat() if row[2] else None,
+        "expires_at": row[3].isoformat() if row[3] else None
+    }
+
+
+# ---------------------------------------------------------
+# 4.1 — PUBLIC FEATURE CATALOG
+# ---------------------------------------------------------
+
+@app.get("/api/v1/features")
+def global_list_features(
+    category: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            if category:
+                cursor.execute("""
+                    SELECT code, name, description, category,
+                           enabled, requires_review, created_at
+                    FROM public.mg_feature_catalog
+                    WHERE enabled = TRUE
+                      AND category = %s
+                    ORDER BY category, name
+                """, (category.strip(),))
+            else:
+                cursor.execute("""
+                    SELECT code, name, description, category,
+                           enabled, requires_review, created_at
+                    FROM public.mg_feature_catalog
+                    WHERE enabled = TRUE
+                    ORDER BY category, name
+                """)
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "features": [global_feature_dict(row) for row in rows]
+    }
+
+
+@app.get("/api/v1/features/{feature_code}")
+def global_get_feature(
+    feature_code: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT code, name, description, category,
+                       enabled, requires_review, created_at
+                FROM public.mg_feature_catalog
+                WHERE code = %s AND enabled = TRUE
+            """, (feature_code,))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Feature not found")
+
+    return {
+        "success": True,
+        "feature": global_feature_dict(row)
+    }
+
+
+# ---------------------------------------------------------
+# 4.2 — USER FEATURE REQUESTS
+# ---------------------------------------------------------
+
+@app.post("/api/v1/features/requests")
+def global_create_feature_request(
+    data: GlobalFeatureRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    feature_code = data.feature_code.strip().lower()
+    message = (data.message or "").strip()
+
+    if not re.fullmatch(r"[a-z0-9_]{2,64}", feature_code):
+        raise HTTPException(status_code=422, detail="Invalid feature code")
+
+    if len(message) > 2000:
+        raise HTTPException(status_code=422, detail="Message is too long")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT code, name, enabled
+                FROM public.mg_feature_catalog
+                WHERE code = %s
+            """, (feature_code,))
+            feature = cursor.fetchone()
+
+            if not feature or not feature[2]:
+                raise HTTPException(status_code=404, detail="Feature is unavailable")
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_user_feature_entitlements
+                WHERE user_id = %s
+                  AND feature_code = %s
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                LIMIT 1
+            """, (user["id"], feature_code))
+
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="This feature is already active for your account"
+                )
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_feature_requests
+                WHERE user_id = %s
+                  AND feature_code = %s
+                  AND status IN ('pending', 'approved')
+                LIMIT 1
+            """, (user["id"], feature_code))
+
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="You already have an active request for this feature"
+                )
+
+            cursor.execute("""
+                INSERT INTO public.mg_feature_requests
+                    (user_id, feature_code, message, status, created_at)
+                VALUES (%s, %s, %s, 'pending', NOW())
+                RETURNING id, created_at
+            """, (user["id"], feature_code, message))
+
+            request_row = cursor.fetchone()
+
+            global_audit(
+                cursor,
+                user["id"],
+                "feature_request_created",
+                "feature",
+                feature_code,
+                {"request_id": str(request_row[0])}
+            )
+
+            create_global_notification(
+                cursor,
+                user["id"],
+                "feature_request_submitted",
+                "درخواست قابلیت ثبت شد",
+                f"درخواست فعال‌سازی {feature[1]} برای بررسی ارسال شد"
+            )
+
+    return {
+        "success": True,
+        "message": "درخواست با موفقیت ثبت شد",
+        "request": {
+            "id": str(request_row[0]),
+            "feature_code": feature_code,
+            "feature_name": feature[1],
+            "status": "pending",
+            "created_at": request_row[1].isoformat()
+        }
+    }
+
+
+@app.get("/api/v1/features/requests/me")
+def global_my_feature_requests(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT r.id, r.feature_code, f.name, r.message,
+                       r.status, r.admin_note, r.created_at, r.reviewed_at
+                FROM public.mg_feature_requests r
+                JOIN public.mg_feature_catalog f
+                  ON f.code = r.feature_code
+                WHERE r.user_id = %s
+                ORDER BY r.created_at DESC
+                LIMIT 200
+            """, (user["id"],))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "requests": [global_feature_request_dict(row) for row in rows]
+    }
+
+
+@app.get("/api/v1/features/me")
+def global_my_active_features(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT e.feature_code, f.name,
+                       e.activated_at, e.expires_at
+                FROM public.mg_user_feature_entitlements e
+                JOIN public.mg_feature_catalog f
+                  ON f.code = e.feature_code
+                WHERE e.user_id = %s
+                  AND e.revoked_at IS NULL
+                  AND (e.expires_at IS NULL OR e.expires_at > NOW())
+                  AND f.enabled = TRUE
+                ORDER BY e.activated_at DESC
+            """, (user["id"],))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "active_features": [global_entitlement_dict(row) for row in rows]
+    }
+
+
+# ---------------------------------------------------------
+# 4.3 — ADMIN FEATURE CATALOG CONTROL
+# ---------------------------------------------------------
+
+@app.get("/api/v1/admin/features")
+def global_admin_list_features(
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT code, name, description, category,
+                       enabled, requires_review, created_at
+                FROM public.mg_feature_catalog
+                ORDER BY category, name
+            """)
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "features": [global_feature_dict(row) for row in rows]
+    }
+
+
+@app.post("/api/v1/admin/features")
+def global_admin_create_feature(
+    data: GlobalFeatureCreate,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    code = data.code.strip().lower()
+    name = data.name.strip()
+    description = data.description.strip()
+    category = data.category.strip().lower()
+
+    if not re.fullmatch(r"[a-z0-9_]{2,64}", code):
+        raise HTTPException(status_code=422, detail="Invalid feature code")
+
+    if not name or len(name) > 120:
+        raise HTTPException(status_code=422, detail="Invalid feature name")
+
+    if len(description) > 3000:
+        raise HTTPException(status_code=422, detail="Description is too long")
+
+    if not category or len(category) > 60:
+        raise HTTPException(status_code=422, detail="Invalid category")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO public.mg_feature_catalog
+                    (code, name, description, category,
+                     enabled, requires_review, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (code) DO NOTHING
+                RETURNING code
+            """, (
+                code,
+                name,
+                description,
+                category,
+                bool(data.enabled),
+                bool(data.requires_review)
+            ))
+
+            created = cursor.fetchone()
+
+            if not created:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A feature with this code already exists"
+                )
+
+            global_audit(
+                cursor,
+                None,
+                "admin_feature_created",
+                "feature",
+                code,
+                {"name": name, "category": category}
+            )
+
+    return {
+        "success": True,
+        "message": "قابلیت جدید ثبت شد",
+        "feature_code": code
+    }
+
+
+@app.patch("/api/v1/admin/features/{feature_code}/status")
+def global_admin_update_feature_status(
+    feature_code: str,
+    enabled: bool,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_feature_catalog
+                SET enabled = %s
+                WHERE code = %s
+                RETURNING code
+            """, (enabled, feature_code))
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Feature not found")
+
+            global_audit(
+                cursor,
+                None,
+                "admin_feature_status_changed",
+                "feature",
+                feature_code,
+                {"enabled": enabled}
+            )
+
+    return {
+        "success": True,
+        "feature_code": feature_code,
+        "enabled": enabled
+    }
+
+
+# ---------------------------------------------------------
+# 4.4 — ADMIN REQUEST REVIEW CENTER
+# ---------------------------------------------------------
+
+@app.get("/api/v1/admin/features/requests")
+def global_admin_feature_requests(
+    status: Optional[str] = None,
+    limit: int = 100,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    limit = max(1, min(limit, 300))
+
+    allowed_statuses = {"pending", "approved", "rejected", "cancelled"}
+    if status and status not in allowed_statuses:
+        raise HTTPException(status_code=422, detail="Invalid request status")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            if status:
+                cursor.execute("""
+                    SELECT r.id, r.feature_code, f.name, r.message,
+                           r.status, r.admin_note, r.created_at, r.reviewed_at
+                    FROM public.mg_feature_requests r
+                    JOIN public.mg_feature_catalog f
+                      ON f.code = r.feature_code
+                    WHERE r.status = %s
+                    ORDER BY r.created_at ASC
+                    LIMIT %s
+                """, (status, limit))
+            else:
+                cursor.execute("""
+                    SELECT r.id, r.feature_code, f.name, r.message,
+                           r.status, r.admin_note, r.created_at, r.reviewed_at
+                    FROM public.mg_feature_requests r
+                    JOIN public.mg_feature_catalog f
+                      ON f.code = r.feature_code
+                    ORDER BY
+                      CASE WHEN r.status = 'pending' THEN 0 ELSE 1 END,
+                      r.created_at ASC
+                    LIMIT %s
+                """, (limit,))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "requests": [global_feature_request_dict(row) for row in rows]
+    }
+
+
+@app.post("/api/v1/admin/features/requests/{request_id}/review")
+def global_admin_review_feature_request(
+    request_id: str,
+    data: GlobalFeatureReview,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    try:
+        request_uuid = uuid.UUID(request_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid request ID")
+
+    if data.status not in ("approved", "rejected"):
+        raise HTTPException(
+            status_code=422,
+            detail="Status must be approved or rejected"
+        )
+
+    admin_note = (data.admin_note or "").strip()
+    if len(admin_note) > 2000:
+        raise HTTPException(status_code=422, detail="Admin note is too long")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT r.id, r.user_id, r.feature_code, r.status,
+                       f.name, f.enabled
+                FROM public.mg_feature_requests r
+                JOIN public.mg_feature_catalog f
+                  ON f.code = r.feature_code
+                WHERE r.id = %s
+                FOR UPDATE OF r
+            """, (request_uuid,))
+
+            request_row = cursor.fetchone()
+
+            if not request_row:
+                raise HTTPException(status_code=404, detail="Request not found")
+
+            if request_row[3] != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail="This request has already been reviewed"
+                )
+
+            if data.status == "approved" and not request_row[5]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This feature is currently disabled"
+                )
+
+            cursor.execute("""
+                UPDATE public.mg_feature_requests
+                SET status = %s,
+                    admin_note = %s,
+                    reviewed_at = NOW()
+                WHERE id = %s
+            """, (data.status, admin_note, request_uuid))
+
+            activated = False
+
+            if data.status == "approved" and bool(data.activate):
+                cursor.execute("""
+                    INSERT INTO public.mg_user_feature_entitlements
+                        (user_id, feature_code, activated_at, expires_at, revoked_at)
+                    VALUES (%s, %s, NOW(), NULL, NULL)
+                    ON CONFLICT (user_id, feature_code)
+                    DO UPDATE SET
+                        activated_at = NOW(),
+                        expires_at = NULL,
+                        revoked_at = NULL
+                """, (request_row[1], request_row[2]))
+
+                activated = True
+
+            global_audit(
+                cursor,
+                None,
+                "admin_feature_request_reviewed",
+                "feature_request",
+                str(request_uuid),
+                {
+                    "status": data.status,
+                    "feature_code": request_row[2],
+                    "activated": activated
+                }
+            )
+
+            create_global_notification(
+                cursor,
+                str(request_row[1]),
+                "feature_request_reviewed",
+                "وضعیت درخواست قابلیت",
+                (
+                    f"درخواست {request_row[4]} تأیید شد"
+                    if data.status == "approved"
+                    else f"درخواست {request_row[4]} رد شد"
+                )
+            )
+
+    return {
+        "success": True,
+        "request_id": str(request_uuid),
+        "status": data.status,
+        "feature_activated": activated
+    }
+
+
+# ---------------------------------------------------------
+# 4.5 — MANUAL USER FEATURE ACTIVATION
+# ---------------------------------------------------------
+
+@app.post("/api/v1/admin/users/{user_id}/features/{feature_code}/activate")
+def global_admin_activate_user_feature(
+    user_id: str,
+    feature_code: str,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    try:
+        target_user_id = uuid.UUID(user_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid user ID")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_users
+                WHERE id = %s
+                  AND account_status = 'active'
+                  AND deleted_at IS NULL
+            """, (target_user_id,))
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="User not found")
+
+            cursor.execute("""
+                SELECT code
+                FROM public.mg_feature_catalog
+                WHERE code = %s AND enabled = TRUE
+            """, (feature_code,))
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Feature not found or disabled")
+
+            cursor.execute("""
+                INSERT INTO public.mg_user_feature_entitlements
+                    (user_id, feature_code, activated_at, expires_at, revoked_at)
+                VALUES (%s, %s, NOW(), NULL, NULL)
+                ON CONFLICT (user_id, feature_code)
+                DO UPDATE SET
+                    activated_at = NOW(),
+                    expires_at = NULL,
+                    revoked_at = NULL
+            """, (target_user_id, feature_code))
+
+            global_audit(
+                cursor,
+                None,
+                "admin_user_feature_activated",
+                "user_feature",
+                f"{user_id}:{feature_code}",
+                {}
+            )
+
+            create_global_notification(
+                cursor,
+                str(target_user_id),
+                "feature_activated",
+                "قابلیت جدید فعال شد",
+                f"قابلیت {feature_code} برای حساب شما فعال شد"
+            )
+
+    return {
+        "success": True,
+        "user_id": str(target_user_id),
+        "feature_code": feature_code,
+        "active": True
+    }
+
+
+@app.delete("/api/v1/admin/users/{user_id}/features/{feature_code}")
+def global_admin_revoke_user_feature(
+    user_id: str,
+    feature_code: str,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    try:
+        target_user_id = uuid.UUID(user_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid user ID")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_user_feature_entitlements
+                SET revoked_at = NOW()
+                WHERE user_id = %s
+                  AND feature_code = %s
+                  AND revoked_at IS NULL
+                RETURNING feature_code
+            """, (target_user_id, feature_code))
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active feature entitlement not found"
+                )
+
+            global_audit(
+                cursor,
+                None,
+                "admin_user_feature_revoked",
+                "user_feature",
+                f"{user_id}:{feature_code}",
+                {}
+            )
+
+            create_global_notification(
+                cursor,
+                str(target_user_id),
+                "feature_revoked",
+                "دسترسی قابلیت تغییر کرد",
+                f"دسترسی قابلیت {feature_code} از حساب شما لغو شد"
+            )
+
+    return {
+        "success": True,
+        "user_id": str(target_user_id),
+        "feature_code": feature_code,
+        "active": False
+    }
+
+
+# =========================================================
+# END OF SECTION 4
+# NEXT: SECTION 5 — NOTIFICATIONS + REPORTS + USER SAFETY
+# =========================================================
