@@ -8761,7 +8761,6 @@ from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from fastapi import Header, HTTPException, Query
 
-
 ACTIVITY_ENGINE_VERSION = "15.0.0"
 ACTIVITY_MAX_PAGE_SIZE = 100
 
