@@ -7551,3 +7551,411 @@ def get_preferences_statistics(
     }
 
 # END OF SECTION 11
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 12 — DEVICE MANAGEMENT ENGINE
+# ============================================================
+
+import uuid as device_uuid_lib
+import re as device_re
+from typing import Optional
+
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+DEVICE_ENGINE_VERSION = "12.0.0"
+
+
+class DeviceRegisterRequest(BaseModel):
+    device_name: str = Field(min_length=2, max_length=100)
+    platform: str = Field(min_length=2, max_length=40)
+    app_version: str = Field(default="unknown", max_length=40)
+    device_model: Optional[str] = Field(default=None, max_length=100)
+
+
+class DeviceRenameRequest(BaseModel):
+    device_name: str = Field(min_length=2, max_length=100)
+
+
+def device_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def device_validate_name(value):
+    value = str(value).strip()
+
+    if not 2 <= len(value) <= 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid device name"
+        )
+
+    if not device_re.fullmatch(
+        r"[\w\s.\-()]+",
+        value,
+        flags=device_re.UNICODE
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid characters in device name"
+        )
+
+    return value
+
+
+def device_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_managed_devices (
+            id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            device_name VARCHAR(100) NOT NULL,
+            platform VARCHAR(40) NOT NULL,
+            app_version VARCHAR(40) NOT NULL DEFAULT 'unknown',
+            device_model VARCHAR(100),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            revoked_at TIMESTAMPTZ
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_managed_devices_user
+        ON mg_managed_devices(user_id, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_managed_devices_active
+        ON mg_managed_devices(user_id, last_seen_at DESC)
+        WHERE revoked_at IS NULL
+    """)
+
+
+def device_row(row):
+    return {
+        "device_id": str(row[0]),
+        "device_name": row[1],
+        "platform": row[2],
+        "app_version": row[3],
+        "device_model": row[4],
+        "created_at": row[5].isoformat() if row[5] else None,
+        "last_seen_at": row[6].isoformat() if row[6] else None,
+        "revoked": row[7] is not None
+    }
+
+
+@app.post("/api/v1/admin/migrations/devices/apply")
+def apply_device_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "DEVICE MANAGEMENT",
+        "version": DEVICE_ENGINE_VERSION
+    }
+
+
+@app.post("/api/v1/devices/register")
+def register_managed_device(
+    data: DeviceRegisterRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    device_name = device_validate_name(data.device_name)
+    platform = data.platform.strip().lower()
+
+    if platform not in (
+        "android", "ios", "windows",
+        "macos", "linux", "web", "other"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported platform"
+        )
+
+    device_id = str(device_uuid_lib.uuid4())
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg_managed_devices (
+                    id,
+                    user_id,
+                    device_name,
+                    platform,
+                    app_version,
+                    device_model
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING
+                    id, device_name, platform,
+                    app_version, device_model,
+                    created_at, last_seen_at, revoked_at
+            """, (
+                device_id,
+                user_id,
+                device_name,
+                platform,
+                data.app_version.strip() or "unknown",
+                data.device_model.strip()
+                if data.device_model else None
+            ))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "device": device_row(row)
+    }
+
+
+@app.get("/api/v1/devices")
+def list_managed_devices(
+    include_revoked: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            if include_revoked:
+                cursor.execute("""
+                    SELECT
+                        id, device_name, platform,
+                        app_version, device_model,
+                        created_at, last_seen_at, revoked_at
+                    FROM mg_managed_devices
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 200
+                """, (user_id,))
+            else:
+                cursor.execute("""
+                    SELECT
+                        id, device_name, platform,
+                        app_version, device_model,
+                        created_at, last_seen_at, revoked_at
+                    FROM mg_managed_devices
+                    WHERE user_id = %s
+                    AND revoked_at IS NULL
+                    ORDER BY last_seen_at DESC
+                    LIMIT 200
+                """, (user_id,))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "devices": [device_row(row) for row in rows],
+        "total": len(rows)
+    }
+
+
+@app.patch("/api/v1/devices/{device_id}/rename")
+def rename_managed_device(
+    device_id: str,
+    data: DeviceRenameRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    try:
+        parsed_id = str(device_uuid_lib.UUID(device_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid device ID"
+        )
+
+    device_name = device_validate_name(data.device_name)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg_managed_devices
+                SET device_name = %s
+                WHERE id = %s
+                AND user_id = %s
+                AND revoked_at IS NULL
+                RETURNING id
+            """, (device_name, parsed_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found"
+        )
+
+    return {
+        "success": True,
+        "device_id": parsed_id,
+        "device_name": device_name
+    }
+
+
+@app.post("/api/v1/devices/{device_id}/revoke")
+def revoke_managed_device(
+    device_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    try:
+        parsed_id = str(device_uuid_lib.UUID(device_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid device ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg_managed_devices
+                SET revoked_at = NOW()
+                WHERE id = %s
+                AND user_id = %s
+                AND revoked_at IS NULL
+                RETURNING id
+            """, (parsed_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found"
+        )
+
+    return {
+        "success": True,
+        "device_id": parsed_id,
+        "revoked": True
+    }
+
+
+@app.delete("/api/v1/devices/{device_id}")
+def delete_managed_device(
+    device_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    try:
+        parsed_id = str(device_uuid_lib.UUID(device_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid device ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_managed_devices
+                WHERE id = %s
+                AND user_id = %s
+                RETURNING id
+            """, (parsed_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Device not found"
+        )
+
+    return {
+        "success": True,
+        "deleted": True,
+        "device_id": parsed_id
+    }
+
+
+@app.post("/api/v1/devices/{device_id}/heartbeat")
+def managed_device_heartbeat(
+    device_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = device_user_id(user)
+
+    try:
+        parsed_id = str(device_uuid_lib.UUID(device_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid device ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            device_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg_managed_devices
+                SET last_seen_at = NOW()
+                WHERE id = %s
+                AND user_id = %s
+                AND revoked_at IS NULL
+                RETURNING last_seen_at
+            """, (parsed_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Active device not found"
+        )
+
+    return {
+        "success": True,
+        "device_id": parsed_id,
+        "last_seen_at": row[0].isoformat()
+    }
+
+
+# END OF SECTION 12
