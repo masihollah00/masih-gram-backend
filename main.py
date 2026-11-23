@@ -8752,17 +8752,23 @@ def np_delete_preferences(
 # ============================================================
 # MASIH GRAM GLOBAL
 # SECTION 15 — ACCOUNT ACTIVITY HISTORY ENGINE
+# VERSION: 15.1.0 — INTEGRATED EDITION
 # ============================================================
 
 import uuid as activity_uuid_lib
+import json as activity_json
+import ipaddress as activity_ipaddress
 import re as activity_re
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
-from fastapi import Header, HTTPException, Query
+from fastapi import Header, HTTPException, Query, Request
 
-ACTIVITY_ENGINE_VERSION = "15.0.0"
+
+ACTIVITY_ENGINE_VERSION = "15.1.0"
 ACTIVITY_MAX_PAGE_SIZE = 100
+ACTIVITY_DEFAULT_PAGE_SIZE = 30
+ACTIVITY_MAX_RETENTION_DAYS = 3650
 
 ACTIVITY_ALLOWED_TYPES = {
     "login",
@@ -8776,14 +8782,34 @@ ACTIVITY_ALLOWED_TYPES = {
     "security_alert"
 }
 
+ACTIVITY_CLIENT_ALLOWED_TYPES = {
+    "profile_updated",
+    "device_registered"
+}
+
+ACTIVITY_ALLOWED_DETAIL_KEYS = {
+    "method",
+    "source",
+    "reason",
+    "location_label"
+}
+
+
+# ------------------------------------------------------------
+# REQUEST MODELS
+# ------------------------------------------------------------
 
 class ActivityCreateRequest(BaseModel):
     event_type: str
-    device_name: Optional[str] = None
-    platform: Optional[str] = None
-    app_version: Optional[str] = None
+    device_name: Optional[str] = Field(default=None, max_length=120)
+    platform: Optional[str] = Field(default=None, max_length=40)
+    app_version: Optional[str] = Field(default=None, max_length=40)
     details: Optional[dict] = None
 
+
+# ------------------------------------------------------------
+# IDENTITY VALIDATION
+# ------------------------------------------------------------
 
 def activity_user_id(user):
     if isinstance(user, dict):
@@ -8800,8 +8826,20 @@ def activity_user_id(user):
             detail="User identity unavailable"
         )
 
-    return str(value)
+    value = str(value).strip()
 
+    if not value or len(value) > 200:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid user identity"
+        )
+
+    return value
+
+
+# ------------------------------------------------------------
+# TEXT VALIDATION
+# ------------------------------------------------------------
 
 def activity_clean_text(value, maximum=120):
     if value is None:
@@ -8834,18 +8872,10 @@ def activity_validate_details(details):
             detail="Details must be an object"
         )
 
-    # Avoid storing arbitrary or sensitive client data.
-    allowed = {
-        "method",
-        "source",
-        "reason",
-        "location_label"
-    }
-
     result = {}
 
     for key, value in details.items():
-        if key not in allowed:
+        if key not in ACTIVITY_ALLOWED_DETAIL_KEYS:
             continue
 
         if not isinstance(value, (str, int, bool)):
@@ -8859,7 +8889,12 @@ def activity_validate_details(details):
     return result
 
 
+# ------------------------------------------------------------
+# DATABASE SCHEMA
+# ------------------------------------------------------------
+
 def activity_require_schema(cursor):
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS mg_account_activity (
             id BIGSERIAL PRIMARY KEY,
@@ -8870,7 +8905,7 @@ def activity_require_schema(cursor):
             platform VARCHAR(40),
             app_version VARCHAR(40),
             ip_address INET,
-            user_agent TEXT,
+            user_agent VARCHAR(500),
             details JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -8878,16 +8913,26 @@ def activity_require_schema(cursor):
 
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS
-        idx_mg_account_activity_user_created
-        ON mg_account_activity(user_id, created_at DESC)
+        idx_mg_activity_user_created
+        ON mg_account_activity (user_id, created_at DESC)
     """)
 
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS
-        idx_mg_account_activity_type_created
-        ON mg_account_activity(event_type, created_at DESC)
+        idx_mg_activity_event_type
+        ON mg_account_activity (event_type)
     """)
 
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_activity_event_id
+        ON mg_account_activity (event_id)
+    """)
+
+
+# ------------------------------------------------------------
+# EVENT RECORDING ENGINE
+# ------------------------------------------------------------
 
 def activity_record(
     cursor,
@@ -8900,8 +8945,29 @@ def activity_record(
     user_agent=None,
     details=None
 ):
+
     if event_type not in ACTIVITY_ALLOWED_TYPES:
-        raise ValueError("Unsupported activity event type")
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported activity event type"
+        )
+
+    user_id = activity_user_id({"id": user_id})
+
+    device_name = activity_clean_text(device_name, 120)
+    platform = activity_clean_text(platform, 40)
+    app_version = activity_clean_text(app_version, 40)
+    user_agent = activity_clean_text(user_agent, 500)
+
+    if ip_address is not None:
+        try:
+            ip_address = str(
+                activity_ipaddress.ip_address(ip_address)
+            )
+        except ValueError:
+            ip_address = None
+
+    safe_details = activity_validate_details(details)
 
     cursor.execute("""
         INSERT INTO mg_account_activity (
@@ -8922,15 +8988,15 @@ def activity_record(
         RETURNING id, event_id, created_at
     """, (
         str(activity_uuid_lib.uuid4()),
-        str(user_id),
+        user_id,
         event_type,
-        activity_clean_text(device_name),
-        activity_clean_text(platform, 40),
-        activity_clean_text(app_version, 40),
+        device_name,
+        platform,
+        app_version,
         ip_address,
-        activity_clean_text(user_agent, 500),
+        user_agent,
         activity_json.dumps(
-            activity_validate_details(details),
+            safe_details,
             ensure_ascii=False
         )
     ))
@@ -8938,10 +9004,49 @@ def activity_record(
     return cursor.fetchone()
 
 
+# ------------------------------------------------------------
+# TRUSTED SERVER EVENT API
+# ------------------------------------------------------------
+
+def activity_record_server_event(
+    user_id,
+    event_type,
+    device_name=None,
+    platform=None,
+    app_version=None,
+    ip_address=None,
+    user_agent=None,
+    details=None
+):
+    if event_type not in ACTIVITY_ALLOWED_TYPES:
+        raise ValueError("Unsupported activity event type")
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+            return activity_record(
+                cursor=cursor,
+                user_id=user_id,
+                event_type=event_type,
+                device_name=device_name,
+                platform=platform,
+                app_version=app_version,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                details=details
+            )
+
+
+# ------------------------------------------------------------
+# ADMIN DATABASE MIGRATION
+# ------------------------------------------------------------
+
 @app.post("/api/v1/admin/migrations/account-activity/apply")
 def activity_apply_migration(
     authorization: Optional[str] = Header(default=None)
 ):
+
     global_admin_check(authorization)
 
     with get_db() as conn:
@@ -8951,9 +9056,14 @@ def activity_apply_migration(
     return {
         "success": True,
         "engine": "ACCOUNT ACTIVITY HISTORY",
-        "version": ACTIVITY_ENGINE_VERSION
+        "version": ACTIVITY_ENGINE_VERSION,
+        "migration": "completed"
     }
 
+
+# ------------------------------------------------------------
+# CLIENT EVENT CREATION
+# ------------------------------------------------------------
 
 @app.post("/api/v1/account/activity")
 def activity_create(
@@ -8961,6 +9071,7 @@ def activity_create(
     request: Request,
     authorization: Optional[str] = Header(default=None)
 ):
+
     user = global_user(authorization)
     user_id = activity_user_id(user)
 
@@ -8970,32 +9081,24 @@ def activity_create(
             detail="Unsupported activity event type"
         )
 
-    # Clients may report ordinary activity only.
-    # Security-critical events must be recorded by trusted
-    # authentication and session-management code.
-    client_allowed = {
-        "profile_updated",
-        "device_registered"
-    }
-
-    if data.event_type not in client_allowed:
+    if data.event_type not in ACTIVITY_CLIENT_ALLOWED_TYPES:
         raise HTTPException(
             status_code=403,
             detail="This event must be recorded by the server"
         )
 
-    forwarded = request.headers.get("x-forwarded-for")
-    ip_address = (
-        forwarded.split(",")[0].strip()
-        if forwarded else (
-            request.client.host if request.client else None
-        )
-    )
+    # Use the direct client address.
+    # Forwarded headers are not trusted by default.
+    ip_address = None
+
+    if request.client:
+        ip_address = request.client.host
 
     if ip_address:
         try:
-            import ipaddress
-            ip_address = str(ipaddress.ip_address(ip_address))
+            ip_address = str(
+                activity_ipaddress.ip_address(ip_address)
+            )
         except ValueError:
             ip_address = None
 
@@ -9020,17 +9123,28 @@ def activity_create(
     return {
         "success": True,
         "event_id": str(row[1]),
-        "created_at": row[2].isoformat()
+        "created_at": (
+            row[2].isoformat() if row[2] else None
+        )
     }
 
+
+# ------------------------------------------------------------
+# ACTIVITY HISTORY
+# ------------------------------------------------------------
 
 @app.get("/api/v1/account/activity")
 def activity_list(
     event_type: Optional[str] = Query(default=None),
-    limit: int = Query(default=30, ge=1, le=100),
+    limit: int = Query(
+        default=ACTIVITY_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=ACTIVITY_MAX_PAGE_SIZE
+    ),
     offset: int = Query(default=0, ge=0),
     authorization: Optional[str] = Header(default=None)
 ):
+
     user = global_user(authorization)
     user_id = activity_user_id(user)
 
@@ -9047,10 +9161,16 @@ def activity_list(
             if event_type:
                 cursor.execute("""
                     SELECT
-                        id, event_id, event_type,
-                        device_name, platform, app_version,
-                        ip_address::text, user_agent,
-                        details, created_at
+                        id,
+                        event_id,
+                        event_type,
+                        device_name,
+                        platform,
+                        app_version,
+                        ip_address::text,
+                        user_agent,
+                        details,
+                        created_at
                     FROM mg_account_activity
                     WHERE user_id = %s
                       AND event_type = %s
@@ -9062,13 +9182,20 @@ def activity_list(
                     limit,
                     offset
                 ))
+
             else:
                 cursor.execute("""
                     SELECT
-                        id, event_id, event_type,
-                        device_name, platform, app_version,
-                        ip_address::text, user_agent,
-                        details, created_at
+                        id,
+                        event_id,
+                        event_type,
+                        device_name,
+                        platform,
+                        app_version,
+                        ip_address::text,
+                        user_agent,
+                        details,
+                        created_at
                     FROM mg_account_activity
                     WHERE user_id = %s
                     ORDER BY created_at DESC, id DESC
@@ -9085,7 +9212,10 @@ def activity_list(
                 SELECT COUNT(*)
                 FROM mg_account_activity
                 WHERE user_id = %s
-                  AND (%s IS NULL OR event_type = %s)
+                  AND (
+                      %s IS NULL
+                      OR event_type = %s
+                  )
             """, (
                 user_id,
                 event_type,
@@ -9114,17 +9244,24 @@ def activity_list(
 
     return {
         "success": True,
+        "engine_version": ACTIVITY_ENGINE_VERSION,
+        "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
-        "items": items
+        "has_more": offset + len(items) < total
     }
 
 
-@app.delete("/api/v1/account/activity")
-def activity_clear_own(
+# ------------------------------------------------------------
+# ACTIVITY SUMMARY
+# ------------------------------------------------------------
+
+@app.get("/api/v1/account/activity/summary")
+def activity_summary(
     authorization: Optional[str] = Header(default=None)
 ):
+
     user = global_user(authorization)
     user_id = activity_user_id(user)
 
@@ -9133,23 +9270,52 @@ def activity_clear_own(
             activity_require_schema(cursor)
 
             cursor.execute("""
-                DELETE FROM mg_account_activity
+                SELECT
+                    event_type,
+                    COUNT(*)
+                FROM mg_account_activity
+                WHERE user_id = %s
+                GROUP BY event_type
+                ORDER BY event_type
+            """, (user_id,))
+
+            rows = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*),
+                    MAX(created_at)
+                FROM mg_account_activity
                 WHERE user_id = %s
             """, (user_id,))
 
-            deleted = cursor.rowcount
+            total, latest = cursor.fetchone()
+
+    event_counts = {
+        row[0]: row[1]
+        for row in rows
+    }
 
     return {
         "success": True,
-        "deleted_count": deleted
+        "total_events": total,
+        "event_counts": event_counts,
+        "latest_activity": (
+            latest.isoformat() if latest else None
+        )
     }
 
 
-@app.post("/api/v1/admin/account-activity/cleanup")
-def activity_admin_cleanup(
-    days: int = Query(default=365, ge=30, le=3650),
+# ------------------------------------------------------------
+# ADMIN ACTIVITY RETENTION CLEANUP
+# ------------------------------------------------------------
+
+@app.delete("/api/v1/admin/account/activity/cleanup")
+def activity_cleanup(
+    days: int = Query(default=365, ge=1, le=ACTIVITY_MAX_RETENTION_DAYS),
     authorization: Optional[str] = Header(default=None)
 ):
+
     global_admin_check(authorization)
 
     with get_db() as conn:
@@ -9165,13 +9331,16 @@ def activity_admin_cleanup(
 
     return {
         "success": True,
+        "engine": "ACCOUNT ACTIVITY HISTORY",
         "retention_days": days,
         "deleted_count": deleted
     }
 
 
+# ============================================================
 # END OF SECTION 15
-
+# ============================================================
+        
 # ============================================================
 # MASIH GRAM GLOBAL
 # SECTION 16 — USER DATA EXPORT ENGINE
