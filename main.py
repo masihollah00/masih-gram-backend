@@ -14,6 +14,7 @@ from typing import Optional
 import httpx
 import psycopg
 from psycopg import errors
+from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
@@ -36,8 +37,8 @@ ACCESS_TOKEN_SECONDS = 900
 REFRESH_TOKEN_DAYS = 30
 
 app = FastAPI(
-    title="MASIH GRAM GLOBAL API",
-    description="MASIH GRAM GLOBAL ULTIMATE ENGINE",
+    title="MASIH GRAM — SIGNATURE DESIGN SYSTEM API",
+    description="ULTRA PREMIUM · GLOBAL EDITION",
     version=APP_VERSION
 )
 
@@ -64,7 +65,8 @@ def get_connection():
     try:
         return psycopg.connect(
             get_database_url(),
-            connect_timeout=10
+            connect_timeout=10,
+            row_factory=hybrid_row
         )
     except HTTPException:
         raise
@@ -75,7 +77,27 @@ def get_connection():
         )
 
 
-# Backward-compatible database accessor used by the feature modules.
+class HybridRow(dict):
+    """Dictionary row that also preserves legacy numeric column indexing."""
+    def __init__(self, columns, values):
+        self._values = tuple(values)
+        super().__init__(zip(columns, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+def hybrid_row(cursor):
+    columns = [column.name for column in (cursor.description or ())]
+    def make_row(values):
+        return HybridRow(columns, values)
+    return make_row
+
+
+# Core and feature modules use both row[0] and row["column"] conventions.
+# A hybrid row keeps both access styles compatible across every connection.
 def get_db():
     return get_connection()
 
@@ -240,6 +262,7 @@ def get_authenticated_user(authorization: Optional[str] = None):
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            require_auth_schema(cursor)
             cursor.execute("""
                 SELECT u.id, u.username, u.display_name, u.phone,
                        u.account_status, s.id
@@ -271,6 +294,150 @@ def get_authenticated_user(authorization: Optional[str] = None):
 # SCHEMA CHECKS AND MIGRATIONS
 # ---------------------------------------------------------
 
+
+def _read_migration_sql(filename: str) -> str:
+    migration_file = Path(__file__).resolve().parent / filename
+    if not migration_file.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Required migration file is missing from the deployed service: {filename}"
+        )
+    sql = migration_file.read_text(encoding="utf-8").strip()
+    if not sql:
+        raise HTTPException(status_code=503, detail=f"Migration file is empty: {filename}")
+    if not re.match(r"(?is)^BEGIN\s*;", sql) or not re.search(r"(?is)COMMIT\s*;\s*$", sql):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Migration transaction boundaries are invalid: {filename}"
+        )
+    sql = re.sub(r"(?is)^BEGIN\s*;", "", sql, count=1)
+    return re.sub(r"(?is)COMMIT\s*;\s*$", "", sql, count=1)
+
+
+@app.post("/api/v1/admin/migrations/core/apply")
+def apply_core_migration(x_admin_key: Optional[str] = Header(default=None)):
+    """Install the idempotent 001 core schema; never runs automatically at startup."""
+    verify_admin_key(x_admin_key)
+    sql = _read_migration_sql("001_initial_core.sql")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("masih_gram_001_initial_core",)
+            )
+            cursor.execute("SELECT to_regclass('public.mg_schema_migrations')")
+            history_exists = cursor.fetchone()[0] is not None
+            if history_exists:
+                cursor.execute(
+                    "SELECT version FROM public.mg_schema_migrations WHERE version = %s",
+                    (MIGRATION_VERSION,)
+                )
+                if cursor.fetchone():
+                    cursor.execute("""
+                        SELECT to_regclass('public.mg_users'),
+                               to_regclass('public.mg_user_profiles'),
+                               to_regclass('public.mg_user_sessions'),
+                               to_regclass('public.mg_user_devices')
+                    """)
+                    if not all((cursor.fetchone() or {}).values()):
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Core migration history exists but required core tables are missing; manual database review is required"
+                        )
+                    return {"success": True, "status": "already_applied", "migration": MIGRATION_VERSION}
+
+            cursor.execute(sql, prepare=False)
+            cursor.execute("""
+                SELECT to_regclass('public.mg_schema_migrations'),
+                       to_regclass('public.mg_users'),
+                       to_regclass('public.mg_user_profiles'),
+                       to_regclass('public.mg_user_sessions'),
+                       to_regclass('public.mg_user_devices')
+            """)
+            if not all((cursor.fetchone() or {}).values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Core migration completed without all required core tables; transaction was rolled back"
+                )
+
+    return {"success": True, "status": "applied", "migration": MIGRATION_VERSION}
+
+
+@app.get("/api/v1/admin/migrations/status")
+def migration_status(x_admin_key: Optional[str] = Header(default=None)):
+    verify_admin_key(x_admin_key)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.mg_schema_migrations')")
+            history_exists = cursor.fetchone()[0] is not None
+            versions = []
+            if history_exists:
+                cursor.execute("""
+                    SELECT version, description, applied_at
+                    FROM public.mg_schema_migrations
+                    ORDER BY applied_at, version
+                """)
+                versions = [
+                    {"version": row[0], "description": row[1],
+                     "applied_at": row[2].isoformat() if row[2] else None}
+                    for row in cursor.fetchall()
+                ]
+            cursor.execute("""
+                SELECT
+                    to_regclass('public.mg_users'),
+                    to_regclass('public.mg_user_profiles'),
+                    to_regclass('public.mg_auth_otp_challenges'),
+                    to_regclass('public.mg_social_posts'),
+                    to_regclass('public.mg_privacy_settings'),
+                    to_regclass('public.mg_privacy_blocks'),
+                    to_regclass('public.mg_follow_requests'),
+                    to_regclass('public.mg_security_events'),
+                    to_regclass('public.mg_message_policies'),
+                    to_regclass('public.mg_message_rate_events'),
+                    to_regclass('public.mg_message_reports'),
+                    to_regclass('public.mg_global_notifications'),
+                    to_regclass('public.mg_global_audit'),
+                    to_regclass('public.mg_direct_messages'),
+                    to_regclass('public.mg_direct_message_reads'),
+                    to_regclass('public.mg_communities'),
+                    to_regclass('public.mg_community_members'),
+                    to_regclass('public.mg_community_messages')
+            """)
+            tables = cursor.fetchone() or (None,) * 18
+
+    base_dir = Path(__file__).resolve().parent
+    return {
+        "success": True,
+        "history_table_installed": history_exists,
+        "migration_files": {
+            "001_initial_core.sql": (base_dir / "001_initial_core.sql").is_file(),
+            "002_auth_engine.sql": (base_dir / "002_auth_engine.sql").is_file(),
+        },
+        "tables": {
+            "mg_users": tables[0] is not None,
+            "mg_user_profiles": tables[1] is not None,
+            "mg_auth_otp_challenges": tables[2] is not None,
+            "mg_social_posts": tables[3] is not None,
+            "mg_privacy_settings": tables[4] is not None,
+            "mg_privacy_blocks": tables[5] is not None,
+            "mg_follow_requests": tables[6] is not None,
+            "mg_security_events": tables[7] is not None,
+            "mg_message_policies": tables[8] is not None,
+            "mg_message_rate_events": tables[9] is not None,
+            "mg_message_reports": tables[10] is not None,
+            "mg_global_notifications": tables[11] is not None,
+            "mg_global_audit": tables[12] is not None,
+            "mg_direct_messages": tables[13] is not None,
+            "mg_direct_message_reads": tables[14] is not None,
+            "mg_communities": tables[15] is not None,
+            "mg_community_members": tables[16] is not None,
+            "mg_community_messages": tables[17] is not None,
+        },
+        "applied_migrations": versions,
+    }
+
+
 def require_auth_schema(cursor):
     cursor.execute("""
         SELECT
@@ -279,7 +446,7 @@ def require_auth_schema(cursor):
             to_regclass('public.mg_user_devices')
     """)
     row = cursor.fetchone()
-    if not row or not all(row):
+    if not row or not all(row.values()):
         raise HTTPException(
             status_code=503,
             detail="Authentication database migration 002 is not installed"
@@ -290,28 +457,22 @@ def require_auth_schema(cursor):
 def apply_auth_migration(x_admin_key: Optional[str] = Header(default=None)):
     verify_admin_key(x_admin_key)
 
-    migration_file = Path(__file__).resolve().parent / "002_auth_engine.sql"
-    if not migration_file.is_file():
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication migration file not found in deployed service"
-        )
-
-    sql = migration_file.read_text(encoding="utf-8").strip()
-    if not sql:
-        raise HTTPException(status_code=500, detail="Migration file is empty")
-
-    if not re.match(r"(?is)^BEGIN\s*;", sql) or not re.search(r"(?is)COMMIT\s*;\s*$", sql):
-        raise HTTPException(
-            status_code=500,
-            detail="Migration transaction boundaries are invalid"
-        )
-
-    sql = re.sub(r"(?is)^BEGIN\s*;", "", sql, count=1)
-    sql = re.sub(r"(?is)COMMIT\s*;\s*$", "", sql, count=1)
+    sql = _read_migration_sql("002_auth_engine.sql")
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT to_regclass('public.mg_schema_migrations'),
+                       to_regclass('public.mg_users'),
+                       to_regclass('public.mg_user_sessions'),
+                       to_regclass('public.mg_user_devices')
+            """)
+            core = cursor.fetchone()
+            if not core or not all(core.values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Install core database migration 001_initial_core before authentication migration 002"
+                )
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("masih_gram_002_auth_engine",)
@@ -333,6 +494,7 @@ def apply_auth_migration(x_admin_key: Optional[str] = Header(default=None)):
 
             # The migration file contains only trusted, version-controlled SQL.
             cursor.execute(sql, prepare=False)
+            require_auth_schema(cursor)
 
     return {
         "success": True,
@@ -346,38 +508,98 @@ def apply_auth_migration(x_admin_key: Optional[str] = Header(default=None)):
 # ---------------------------------------------------------
 
 def send_textbee_sms(phone: str, message: str) -> str:
-    api_key = os.getenv("TEXTBEE_API_KEY")
+    """Submit an OTP to TextBee and validate the provider's acceptance response."""
+    api_key = (os.getenv("TEXTBEE_API_KEY") or "").strip()
     if not api_key:
         raise HTTPException(status_code=503, detail="SMS provider is not configured")
+
+    payload = {"recipients": [phone], "message": message}
+    device_id = (os.getenv("TEXTBEE_DEVICE_ID") or "").strip()
+    if device_id:
+        payload["deviceId"] = device_id
+
+    sim_slot_raw = (os.getenv("TEXTBEE_SIM_SLOT_INDEX") or "").strip()
+    if sim_slot_raw:
+        try:
+            sim_slot = int(sim_slot_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=503,
+                detail="TEXTBEE_SIM_SLOT_INDEX must be 0 or 1"
+            )
+        if sim_slot not in (0, 1):
+            raise HTTPException(
+                status_code=503,
+                detail="TEXTBEE_SIM_SLOT_INDEX must be 0 or 1"
+            )
+        payload["simSlotIndex"] = sim_slot
 
     try:
         response = httpx.post(
             TEXTBEE_URL,
             headers={
                 "x-api-key": api_key,
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Accept": "application/json",
             },
-            json={"recipients": [phone], "message": message},
-            timeout=20
+            json=payload,
+            timeout=25,
         )
-        if response.status_code < 200 or response.status_code >= 300:
-            raise HTTPException(status_code=502, detail="SMS provider rejected the request")
+        try:
+            result = response.json()
+        except (ValueError, TypeError):
+            result = {}
 
-        result = response.json()
+        if response.status_code < 200 or response.status_code >= 300:
+            reason = (result.get("message") or result.get("error") or
+                      result.get("detail") or "TextBee rejected the SMS request")
+            raise HTTPException(
+                status_code=502,
+                detail=f"TextBee HTTP {response.status_code}: {str(reason)[:240]}"
+            )
+
         data = result.get("data") or {}
+        warning = data.get("warning") or {}
+        if str(warning.get("code") or "") == "SMS_PERMISSION_MISSING":
+            raise HTTPException(
+                status_code=502,
+                detail="TextBee device has no SMS permission. Enable SMS permission in the TextBee Android app."
+            )
+
+        success_count = data.get("successCount")
+        failure_count = data.get("failureCount")
+        if success_count is not None and failure_count is not None:
+            try:
+                if int(success_count) < 1 and int(failure_count) > 0:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="TextBee could not push the SMS to the sending phone. Check device connection and SMS permission."
+                    )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=502,
+                    detail="TextBee returned an invalid delivery summary"
+                )
+
         batch_id = data.get("smsBatchId")
         if not batch_id:
             raise HTTPException(
                 status_code=502,
-                detail="SMS provider did not confirm the batch"
+                detail="TextBee did not return an SMS batch ID; provider acceptance was not confirmed"
             )
         return str(batch_id)
+
     except HTTPException:
         raise
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=502,
+            detail="TextBee request timed out; check the provider and gateway device status"
+        )
     except Exception:
         raise HTTPException(
             status_code=502,
-            detail="SMS provider is temporarily unavailable"
+            detail="TextBee is temporarily unavailable; check server logs and gateway status"
         )
 
 
@@ -398,6 +620,7 @@ def request_otp(data: OTPRequest, request: Request):
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            require_auth_schema(cursor)
             # Serialize requests for the same phone/purpose so simultaneous
             # requests cannot bypass resend/hourly limits.
             cursor.execute(
@@ -497,7 +720,7 @@ def request_otp(data: OTPRequest, request: Request):
         }
 
     message = (
-        "MASIH GRAM | مسیح، شاه مجازی\n"
+        "MASIH GRAM — ULTRA PREMIUM\n"
         f"Your verification code: {code}\n"
         "Valid for 5 minutes. Do not share this code."
     )
@@ -556,6 +779,7 @@ def verify_otp(data: OTPVerify, request: Request):
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            require_auth_schema(cursor)
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
                 (phone, data.purpose)
@@ -752,6 +976,7 @@ def refresh_access_token(data: RefreshRequest):
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            require_auth_schema(cursor)
             cursor.execute("""
                 SELECT s.id, s.user_id
                 FROM public.mg_user_sessions s
@@ -933,9 +1158,10 @@ def revoke_session(
 @app.get("/")
 def root():
     return {
-        "name": "MASIH GRAM GLOBAL",
-        "brand": "مسیح، شاه مجازی",
-        "edition": "GLOBAL ULTIMATE",
+        "name": "MASIH GRAM",
+        "brand": "MASIH GRAM — SIGNATURE DESIGN SYSTEM",
+        "edition": "ULTRA PREMIUM · GLOBAL EDITION",
+        "design_system": "MASIH GRAM — SIGNATURE DESIGN SYSTEM",
         "status": "online",
         "version": APP_VERSION,
         "server_time": utcnow().isoformat()
@@ -993,23 +1219,24 @@ def database_tables(x_admin_key: Optional[str] = Header(default=None)):
 def system_info():
     return {
         "application": "MASIH GRAM",
-        "brand": "مسیح، شاه مجازی",
-        "edition": "GLOBAL ULTIMATE",
+        "brand": "MASIH GRAM — SIGNATURE DESIGN SYSTEM",
+        "edition": "ULTRA PREMIUM · GLOBAL EDITION",
+        "design_system": "MASIH GRAM — SIGNATURE DESIGN SYSTEM",
         "api_version": "v1",
         "backend_version": APP_VERSION,
         "modules": {
-            "authentication": "implemented_pending_migration_check",
-            "otp": "implemented_pending_provider_test",
-            "sessions": "implemented",
-            "devices": "implemented",
-            "messaging": "database_foundation_only",
-            "groups": "database_foundation_only",
-            "channels": "database_foundation_only",
-            "media": "database_foundation_only",
-            "social": "not_implemented",
-            "ai": "not_implemented",
-            "cloud": "not_implemented",
-            "live": "not_implemented"
+            "authentication": "routes_implemented_migration_and_provider_test_required",
+            "otp": "implemented_textbee_acceptance_requires_delivery_test",
+            "sessions": "routes_implemented_database_required",
+            "devices": "routes_implemented_database_required",
+            "direct_messaging": "routes_implemented_messenger_migration_required",
+            "groups_and_channels": "routes_implemented_messenger_migration_required",
+            "social_and_discovery": "routes_implemented_global_migration_required",
+            "media_binary_transfer": "not_implemented",
+            "cloud_binary_storage": "not_implemented",
+            "voice_video_calls": "not_implemented",
+            "end_to_end_encryption": "not_implemented",
+            "ai": "not_implemented"
         }
     }
 
@@ -1323,7 +1550,14 @@ ON CONFLICT(code) DO NOTHING
 # GLOBAL SCHEMA INITIALIZATION
 # ---------------------------------------------------------
 
-def require_global_schema(cursor):
+def require_global_schema(cursor=None):
+    """Validate GLOBAL tables; safely support callers with or without a cursor."""
+    if cursor is None:
+        with get_connection() as connection:
+            with connection.cursor() as schema_cursor:
+                require_global_schema(schema_cursor)
+        return
+
     cursor.execute("""
         SELECT
             to_regclass('public.mg_social_posts'),
@@ -1337,7 +1571,7 @@ def require_global_schema(cursor):
     """)
     row = cursor.fetchone()
 
-    if not row or not all(row):
+    if not row or not all(row.values()):
         raise HTTPException(
             status_code=503,
             detail="GLOBAL database migration is not installed"
@@ -1413,14 +1647,35 @@ def apply_global_migration(
                 ("masih_gram_003_global",)
             )
 
+            # Migration 003 depends on the core tables created by 001.
+            # Fail clearly before running any DDL if the prerequisite is absent.
+            cursor.execute("""
+                SELECT
+                    to_regclass('public.mg_schema_migrations'),
+                    to_regclass('public.mg_users'),
+                    to_regclass('public.mg_user_profiles'),
+                    to_regclass('public.mg_auth_otp_challenges'),
+                    to_regclass('public.mg_user_sessions')
+            """)
+            core_tables = cursor.fetchone()
+            if not core_tables or not all(core_tables):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Install core 001_initial_core and auth 002_auth_engine before GLOBAL migration 003"
+                )
+
             for statement in GLOBAL_SCHEMA_STATEMENTS:
                 cursor.execute(statement, prepare=False)
 
+            # The 001 migration defines description as NOT NULL with no default.
             cursor.execute("""
-                INSERT INTO public.mg_schema_migrations(version)
-                VALUES (%s)
+                INSERT INTO public.mg_schema_migrations(version, description)
+                VALUES (%s, %s)
                 ON CONFLICT(version) DO NOTHING
-            """, (GLOBAL_SCHEMA_VERSION,))
+            """, (
+                GLOBAL_SCHEMA_VERSION,
+                "MASIH GRAM GLOBAL social, discovery and feature foundation"
+            ))
 
             require_global_schema(cursor)
 
@@ -1441,7 +1696,8 @@ def social_post_dict(row, liked=False):
         "user": {
             "id": str(row[1]),
             "username": row[2],
-            "display_name": row[3]
+            "display_name": row[3],
+            "avatar_url": row[11] if len(row) > 11 else None
         },
         "content": row[4],
         "media_url": row[5],
@@ -1459,16 +1715,18 @@ SOCIAL_POST_SELECT = """
         p.id,
         u.id,
         u.username,
-        u.display_name,
+        COALESCE(up.display_name, u.display_name),
         p.content,
         p.media_url,
         p.visibility,
         p.likes_count,
         p.comments_count,
         p.views_count,
-        p.created_at
+        p.created_at,
+        up.avatar_url
     FROM public.mg_social_posts p
     JOIN public.mg_users u ON u.id = p.user_id
+    LEFT JOIN public.mg_user_profiles up ON up.user_id = u.id
 """
 
 
@@ -1544,6 +1802,7 @@ def social_feed(
             cursor.execute(
                 SOCIAL_POST_SELECT + """
                 WHERE p.is_deleted = FALSE
+                  AND u.deleted_at IS NULL
                   AND (
                     p.visibility = 'public'
                     OR p.user_id = %s
@@ -1605,6 +1864,7 @@ def get_social_post(
             cursor.execute(
                 SOCIAL_POST_SELECT + """
                 WHERE p.id = %s AND p.is_deleted = FALSE
+                  AND u.deleted_at IS NULL
                 """,
                 (post_id,)
             )
@@ -2223,7 +2483,7 @@ def update_my_profile(
 
     for field in ("avatar_url", "cover_url"):
         value = updates.get(field)
-        if value and not value.startswith(("https://", "http://")):
+        if value and not value.startswith(("https://",)):
             raise HTTPException(
                 status_code=422,
                 detail=f"Invalid {field}"
@@ -3497,7 +3757,7 @@ def global_create_report(
                     SELECT id, user_id
                     FROM public.mg_social_posts
                     WHERE id = %s
-                      AND deleted_at IS NULL
+                      AND is_deleted = FALSE
                 """, (target_uuid,))
                 target = cursor.fetchone()
 
@@ -3506,7 +3766,7 @@ def global_create_report(
                     SELECT id, user_id
                     FROM public.mg_social_comments
                     WHERE id = %s
-                      AND deleted_at IS NULL
+                      AND is_deleted = FALSE
                 """, (target_uuid,))
                 target = cursor.fetchone()
 
@@ -3817,6 +4077,7 @@ def discovery_post_dict(row):
         "comments_count": int(row.get("comments_count") or 0),
         "engagement_score": float(row.get("engagement_score") or 0),
         "author": {
+            "username": row.get("username"),
             "display_name": row.get("display_name"),
             "avatar_url": row.get("avatar_url"),
         },
@@ -3826,6 +4087,7 @@ def discovery_post_dict(row):
 def discovery_user_dict(row):
     return {
         "id": str(row["id"]),
+        "username": row.get("username"),
         "display_name": row.get("display_name"),
         "bio": row.get("bio"),
         "avatar_url": row.get("avatar_url"),
@@ -3873,13 +4135,14 @@ def global_discovery_search(
     result = {"query": q.strip(), "users": [], "posts": []}
 
     with get_db() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(row_factory=dict_row) as cursor:
 
             if search_type in ("all", "users"):
                 cursor.execute(
                     """
                     SELECT
                         u.id,
+                        u.username,
                         p.display_name,
                         p.bio,
                         p.avatar_url,
@@ -3898,11 +4161,12 @@ def global_discovery_search(
                             SELECT COUNT(*)
                             FROM mg_social_posts sp
                             WHERE sp.user_id = u.id
-                              AND sp.deleted_at IS NULL
+                              AND sp.is_deleted = FALSE
                         ) AS posts_count
                     FROM mg_users u
                     JOIN mg_user_profiles p ON p.user_id = u.id
                     WHERE u.id <> %s
+                      AND u.deleted_at IS NULL
                       AND p.profile_visibility = 'public'
                       AND (
                           p.display_name ILIKE %s ESCAPE '\\'
@@ -3930,6 +4194,7 @@ def global_discovery_search(
                         sp.created_at,
                         p.display_name,
                         p.avatar_url,
+                        u.username,
                         (
                             SELECT COUNT(*)
                             FROM mg_social_likes sl
@@ -3939,6 +4204,7 @@ def global_discovery_search(
                             SELECT COUNT(*)
                             FROM mg_social_comments sc
                             WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                         ) AS comments_count,
                         (
                             SELECT COUNT(*) * 2
@@ -3949,11 +4215,14 @@ def global_discovery_search(
                             SELECT COUNT(*)
                             FROM mg_social_comments sc
                             WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                         ) AS engagement_score
                     FROM mg_social_posts sp
                     JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    JOIN mg_users u ON u.id = sp.user_id
                     WHERE sp.visibility = 'public'
-                      AND sp.deleted_at IS NULL
+                      AND sp.is_deleted = FALSE
+                      AND u.deleted_at IS NULL
                       AND p.profile_visibility = 'public'
                       AND sp.content ILIKE %s ESCAPE '\\'
                     ORDER BY sp.created_at DESC
@@ -3989,7 +4258,7 @@ def global_discovery_trending(
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
                 SELECT
@@ -4000,6 +4269,7 @@ def global_discovery_trending(
                     sp.created_at,
                     p.display_name,
                     p.avatar_url,
+                    u.username,
                     (
                         SELECT COUNT(*)
                         FROM mg_social_likes sl
@@ -4009,6 +4279,7 @@ def global_discovery_trending(
                         SELECT COUNT(*)
                         FROM mg_social_comments sc
                         WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                     ) AS comments_count,
                     (
                         (
@@ -4021,6 +4292,7 @@ def global_discovery_trending(
                             SELECT COUNT(*)
                             FROM mg_social_comments sc
                             WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                         ) * 3
                     )::DOUBLE PRECISION
                     /
@@ -4030,8 +4302,10 @@ def global_discovery_trending(
                     ) AS engagement_score
                 FROM mg_social_posts sp
                 JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    JOIN mg_users u ON u.id = sp.user_id
                 WHERE sp.visibility = 'public'
-                  AND sp.deleted_at IS NULL
+                  AND sp.is_deleted = FALSE
+                      AND u.deleted_at IS NULL
                   AND p.profile_visibility = 'public'
                   AND sp.created_at >= NOW() - INTERVAL '30 days'
                 ORDER BY engagement_score DESC, sp.created_at DESC
@@ -4068,7 +4342,7 @@ def global_discovery_latest(
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
                 SELECT
@@ -4079,6 +4353,7 @@ def global_discovery_latest(
                     sp.created_at,
                     p.display_name,
                     p.avatar_url,
+                    u.username,
                     (
                         SELECT COUNT(*)
                         FROM mg_social_likes sl
@@ -4088,12 +4363,15 @@ def global_discovery_latest(
                         SELECT COUNT(*)
                         FROM mg_social_comments sc
                         WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                     ) AS comments_count,
                     0::DOUBLE PRECISION AS engagement_score
                 FROM mg_social_posts sp
                 JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    JOIN mg_users u ON u.id = sp.user_id
                 WHERE sp.visibility = 'public'
-                  AND sp.deleted_at IS NULL
+                  AND sp.is_deleted = FALSE
+                      AND u.deleted_at IS NULL
                   AND p.profile_visibility = 'public'
                 ORDER BY sp.created_at DESC
                 LIMIT %s OFFSET %s
@@ -4128,11 +4406,12 @@ def global_discovery_creators(
     limit, offset = discovery_pagination(limit, offset)
 
     with get_db() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
                 SELECT
                     u.id,
+                    u.username,
                     p.display_name,
                     p.bio,
                     p.avatar_url,
@@ -4151,11 +4430,12 @@ def global_discovery_creators(
                         SELECT COUNT(*)
                         FROM mg_social_posts sp
                         WHERE sp.user_id = u.id
-                          AND sp.deleted_at IS NULL
+                          AND sp.is_deleted = FALSE
                     ) AS posts_count
                 FROM mg_users u
                 JOIN mg_user_profiles p ON p.user_id = u.id
-                WHERE p.profile_visibility = 'public'
+                WHERE u.deleted_at IS NULL
+                  AND p.profile_visibility = 'public'
                 ORDER BY followers_count DESC, posts_count DESC
                 LIMIT %s OFFSET %s
                 """,
@@ -4199,7 +4479,7 @@ def global_discovery_popular(
     interval = intervals[period]
 
     with get_db() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(row_factory=dict_row) as cursor:
             if interval:
                 cursor.execute(
                     """
@@ -4211,6 +4491,7 @@ def global_discovery_popular(
                         sp.created_at,
                         p.display_name,
                         p.avatar_url,
+                        u.username,
                         (
                             SELECT COUNT(*)
                             FROM mg_social_likes sl
@@ -4220,6 +4501,7 @@ def global_discovery_popular(
                             SELECT COUNT(*)
                             FROM mg_social_comments sc
                             WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                         ) AS comments_count,
                         (
                             (
@@ -4232,12 +4514,15 @@ def global_discovery_popular(
                                 SELECT COUNT(*)
                                 FROM mg_social_comments sc
                                 WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                             ) * 3
                         )::DOUBLE PRECISION AS engagement_score
                     FROM mg_social_posts sp
                     JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    JOIN mg_users u ON u.id = sp.user_id
                     WHERE sp.visibility = 'public'
-                      AND sp.deleted_at IS NULL
+                      AND sp.is_deleted = FALSE
+                      AND u.deleted_at IS NULL
                       AND p.profile_visibility = 'public'
                       AND sp.created_at >= NOW() - %s::INTERVAL
                     ORDER BY engagement_score DESC, sp.created_at DESC
@@ -4256,6 +4541,7 @@ def global_discovery_popular(
                         sp.created_at,
                         p.display_name,
                         p.avatar_url,
+                        u.username,
                         (
                             SELECT COUNT(*)
                             FROM mg_social_likes sl
@@ -4265,6 +4551,7 @@ def global_discovery_popular(
                             SELECT COUNT(*)
                             FROM mg_social_comments sc
                             WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                         ) AS comments_count,
                         (
                             (
@@ -4277,12 +4564,15 @@ def global_discovery_popular(
                                 SELECT COUNT(*)
                                 FROM mg_social_comments sc
                                 WHERE sc.post_id = sp.id
+                              AND sc.is_deleted = FALSE
                             ) * 3
                         )::DOUBLE PRECISION AS engagement_score
                     FROM mg_social_posts sp
                     JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    JOIN mg_users u ON u.id = sp.user_id
                     WHERE sp.visibility = 'public'
-                      AND sp.deleted_at IS NULL
+                      AND sp.is_deleted = FALSE
+                      AND u.deleted_at IS NULL
                       AND p.profile_visibility = 'public'
                     ORDER BY engagement_score DESC, sp.created_at DESC
                     LIMIT %s OFFSET %s
@@ -4625,12 +4915,30 @@ def apply_privacy_migration(
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("masih_gram_privacy_v1",))
+            cursor.execute("""
+                SELECT to_regclass('public.mg_schema_migrations'),
+                       to_regclass('public.mg_users'),
+                       to_regclass('public.mg_auth_otp_challenges'),
+                       to_regclass('public.mg_user_sessions')
+            """)
+            core = cursor.fetchone()
+            if not core or not all(core.values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Install core 001_initial_core and auth 002_auth_engine before privacy migration"
+                )
             for statement in statements:
                 cursor.execute(statement)
+            privacy_require_schema(cursor)
+            cursor.execute("""
+                INSERT INTO public.mg_schema_migrations(version, description)
+                VALUES (%s, %s) ON CONFLICT(version) DO NOTHING
+            """, ("privacy_security_v1", "MASIH GRAM privacy, blocking and account safety"))
 
     return {
         "success": True,
-        "migration": "privacy_security_engine",
+        "migration": "privacy_security_v1",
         "version": PRIVACY_ENGINE_VERSION,
         "message": "ساختار دیتابیس حریم خصوصی ایجاد شد"
     }
@@ -5509,12 +5817,31 @@ def apply_messaging_migration(
 
     with get_db() as conn:
         with conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("masih_gram_messaging_permissions_v1",))
+            cursor.execute("""
+                SELECT to_regclass('public.mg_schema_migrations'),
+                       to_regclass('public.mg_users'),
+                       to_regclass('public.mg_auth_otp_challenges'),
+                       to_regclass('public.mg_user_sessions')
+            """)
+            core = cursor.fetchone()
+            if not core or not all(core.values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Install core 001_initial_core and auth 002_auth_engine before messaging-permissions migration"
+                )
+            privacy_require_schema(cursor)
             for statement in statements:
                 cursor.execute(statement)
+            messaging_require_schema(cursor)
+            cursor.execute("""
+                INSERT INTO public.mg_schema_migrations(version, description)
+                VALUES (%s, %s) ON CONFLICT(version) DO NOTHING
+            """, ("messaging_permissions_v1", "MASIH GRAM messaging policy and anti-spam limits"))
 
     return {
         "success": True,
-        "migration": "messaging_permissions_antispam",
+        "migration": "messaging_permissions_v1",
         "version": MESSAGING_ENGINE_VERSION,
     }
 
@@ -5559,7 +5886,7 @@ def messaging_check_permission(
         }
 
     cursor.execute(
-        "SELECT id FROM mg_users WHERE id = %s",
+        "SELECT id FROM mg_users WHERE id = %s AND account_status = 'active' AND deleted_at IS NULL",
         (recipient_id,),
     )
 
@@ -13332,6 +13659,29 @@ def mg3_text(value, maximum=10000):
 @app.post("/api/v1/admin/migrations/messenger-core/apply")
 def mg3_apply_messenger_migration(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")):
     verify_admin_key(x_admin_key)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT to_regclass('public.mg_schema_migrations'),
+                       to_regclass('public.mg_users'),
+                       to_regclass('public.mg_auth_otp_challenges'),
+                       to_regclass('public.mg_user_sessions'),
+                       to_regclass('public.mg_global_notifications'),
+                       to_regclass('public.mg_privacy_settings'),
+                       to_regclass('public.mg_privacy_blocks'),
+                       to_regclass('public.mg_follow_requests'),
+                       to_regclass('public.mg_security_events'),
+                       to_regclass('public.mg_message_policies'),
+                       to_regclass('public.mg_message_rate_events'),
+                       to_regclass('public.mg_message_reports')
+            """)
+            prerequisites = cur.fetchone()
+            if not prerequisites or not all(prerequisites.values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Install core 001, auth 002, global 003, privacy and messaging-permissions migrations before messenger-core"
+                )
+
     statements = [
         """CREATE TABLE IF NOT EXISTS public.mg_direct_messages (
             id UUID PRIMARY KEY,
@@ -13403,6 +13753,29 @@ def mg3_apply_messenger_migration(x_admin_key: Optional[str] = Header(None, alia
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("masih_gram_messenger_core_v3",))
             for statement in statements:
                 cur.execute(statement)
+            cur.execute("""
+                SELECT to_regclass('public.mg_direct_messages'),
+                       to_regclass('public.mg_direct_message_reads'),
+                       to_regclass('public.mg_direct_message_reactions'),
+                       to_regclass('public.mg_communities'),
+                       to_regclass('public.mg_community_members'),
+                       to_regclass('public.mg_community_messages'),
+                       to_regclass('public.mg_community_message_reads')
+            """)
+            messenger_tables = cur.fetchone()
+            if not messenger_tables or not all(messenger_tables.values()):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Messenger core migration did not create all required tables"
+                )
+            cur.execute("""
+                INSERT INTO public.mg_schema_migrations(version, description)
+                VALUES (%s, %s)
+                ON CONFLICT(version) DO NOTHING
+            """, (
+                "messenger_core_v3",
+                "MASIH GRAM direct messaging, groups and channels"
+            ))
     return {"success": True, "migration": "messenger_core_v3", "tables": 7, "message": "هسته پیام‌رسان و انجمن‌ها آماده شد"}
 
 
@@ -13436,12 +13809,19 @@ def mg3_list_conversations(limit: int = 50, offset: int = 0, authorization: Opti
                 FROM public.mg_direct_messages
                 WHERE (sender_id=%s AND deleted_for_sender=FALSE) OR (recipient_id=%s AND deleted_for_recipient=FALSE)
                 ORDER BY CASE WHEN sender_id=%s THEN recipient_id ELSE sender_id END, created_at DESC
-            ) SELECT l.partner_id,u.username,u.display_name,l.content,l.created_at,l.sender_id
-              FROM latest l JOIN public.mg_users u ON u.id=l.partner_id
+            ) SELECT l.partner_id,u.username,u.display_name,l.content,l.created_at,l.sender_id,
+                (SELECT COUNT(*) FROM public.mg_direct_messages unread
+                 WHERE unread.sender_id=l.partner_id AND unread.recipient_id=%s
+                   AND unread.deleted_for_recipient=FALSE
+                   AND NOT EXISTS (
+                       SELECT 1 FROM public.mg_direct_message_reads rr
+                       WHERE rr.message_id=unread.id AND rr.user_id=%s
+                   )) AS unread_count
+              FROM latest l JOIN public.mg_users u ON u.id=l.partner_id AND u.deleted_at IS NULL
               ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
-              (user["id"],user["id"],user["id"],user["id"],user["id"],limit,offset))
+              (user["id"],user["id"],user["id"],user["id"],user["id"],user["id"],user["id"],limit,offset))
             rows=cur.fetchall()
-    return {"success":True,"conversations":[{"partner_id":str(r[0]),"username":r[1],"display_name":r[2],"last_message":r[3],"created_at":r[4].isoformat(),"last_message_mine":str(r[5])==user["id"]} for r in rows],"limit":limit,"offset":offset}
+    return {"success":True,"conversations":[{"partner_id":str(r[0]),"username":r[1],"display_name":r[2],"last_message":r[3],"created_at":r[4].isoformat(),"last_message_mine":str(r[5])==user["id"],"unread_count":int(r[6] or 0)} for r in rows],"limit":limit,"offset":offset}
 
 
 @app.get("/api/v1/messaging/conversations/{partner_id}")
@@ -13451,7 +13831,7 @@ def mg3_get_conversation(partner_id: str, limit: int = 100, before: Optional[str
         with conn.cursor() as cur:
             mg3_check_dm_access(cur,user["id"],other)
             # Include the partner's read timestamp for messages sent by the current user.
-            params=[other,user["id"],other,user["id"],other]
+            params=[other,user["id"],other,other,user["id"]]
             sql="""SELECT m.id,m.sender_id,m.recipient_id,m.content,m.message_type,m.reply_to_id,m.edited_at,m.created_at,
                           (SELECT r.read_at FROM public.mg_direct_message_reads r
                            WHERE r.message_id=m.id AND r.user_id=%s) AS partner_read_at
@@ -13658,7 +14038,7 @@ def mg3_community_members(community_id: str,limit: int=100,authorization: Option
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,user["id"]))
             if not cur.fetchone(): raise HTTPException(status_code=403,detail="دسترسی مجاز نیست")
-            cur.execute("SELECT u.id,u.username,u.display_name,m.role,m.joined_at FROM public.mg_community_members m JOIN public.mg_users u ON u.id=m.user_id WHERE m.community_id=%s ORDER BY m.joined_at LIMIT %s",(cid,limit)); rows=cur.fetchall()
+            cur.execute("SELECT u.id,u.username,u.display_name,m.role,m.joined_at FROM public.mg_community_members m JOIN public.mg_users u ON u.id=m.user_id WHERE m.community_id=%s AND u.deleted_at IS NULL ORDER BY m.joined_at LIMIT %s",(cid,limit)); rows=cur.fetchall()
     return {"success":True,"members":[{"id":str(r[0]),"username":r[1],"display_name":r[2],"role":r[3],"joined_at":r[4].isoformat()} for r in rows]}
 
 
