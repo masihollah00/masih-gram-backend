@@ -4299,3 +4299,1003 @@ def global_discovery_popular(
 # END SECTION 6
 # NEXT: GLOBAL PRIVACY / BLOCKING / ACCOUNT SAFETY ENGINE
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 7 — PRIVACY & ACCOUNT SECURITY ENGINE
+# ============================================================
+
+import uuid as privacy_uuid
+import secrets as privacy_secrets
+
+from fastapi import Query
+from pydantic import BaseModel, Field
+
+
+PRIVACY_ENGINE_VERSION = "1.0.0"
+
+
+# ------------------------------------------------------------
+# REQUEST MODELS
+# ------------------------------------------------------------
+
+class PrivacySettingsUpdate(BaseModel):
+    private_account: Optional[bool] = None
+    allow_messages_from: Optional[str] = Field(
+        default=None,
+        pattern="^(everyone|followers|nobody)$"
+    )
+    allow_comments_from: Optional[str] = Field(
+        default=None,
+        pattern="^(everyone|followers|nobody)$"
+    )
+    show_followers: Optional[bool] = None
+    show_following: Optional[bool] = None
+    show_online_status: Optional[bool] = None
+    allow_search: Optional[bool] = None
+
+
+class PrivacyBlockRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=64)
+    reason: Optional[str] = Field(default=None, max_length=300)
+
+
+class PrivacyFollowDecision(BaseModel):
+    decision: str = Field(..., pattern="^(accept|reject)$")
+
+
+# ------------------------------------------------------------
+# VALIDATION AND DATABASE HELPERS
+# ------------------------------------------------------------
+
+def privacy_uuid_value(value):
+    try:
+        return privacy_uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="شناسه کاربر معتبر نیست"
+        )
+
+
+def privacy_require_user(authorization):
+    user = global_user(authorization)
+    if not user or not user.get("id"):
+        raise HTTPException(status_code=401, detail="احراز هویت نامعتبر است")
+    return user
+
+
+def privacy_require_schema(cursor):
+    cursor.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name IN (
+              'mg_privacy_settings',
+              'mg_privacy_blocks',
+              'mg_follow_requests',
+              'mg_security_events'
+          )
+    """)
+    found = {row["table_name"] for row in cursor.fetchall()}
+
+    required = {
+        "mg_privacy_settings",
+        "mg_privacy_blocks",
+        "mg_follow_requests",
+        "mg_security_events",
+    }
+
+    if found != required:
+        raise HTTPException(
+            status_code=503,
+            detail="مهاجرت بخش امنیت و حریم خصوصی اجرا نشده است"
+        )
+
+
+def privacy_log_event(
+    cursor,
+    user_id,
+    event_type,
+    target_user_id=None,
+    metadata=None
+):
+    cursor.execute(
+        """
+        INSERT INTO mg_security_events
+        (user_id, target_user_id, event_type, metadata, created_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        """,
+        (
+            user_id,
+            target_user_id,
+            event_type,
+            json.dumps(metadata or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def privacy_get_settings(cursor, user_id):
+    cursor.execute(
+        """
+        SELECT *
+        FROM mg_privacy_settings
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    row = cursor.fetchone()
+
+    if row:
+        return row
+
+    cursor.execute(
+        """
+        INSERT INTO mg_privacy_settings (user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM mg_privacy_settings
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    return cursor.fetchone()
+
+
+def privacy_is_blocked(cursor, user_a, user_b):
+    cursor.execute(
+        """
+        SELECT 1
+        FROM mg_privacy_blocks
+        WHERE (blocker_id = %s AND blocked_id = %s)
+           OR (blocker_id = %s AND blocked_id = %s)
+        LIMIT 1
+        """,
+        (user_a, user_b, user_b, user_a),
+    )
+    return cursor.fetchone() is not None
+
+
+def privacy_is_following(cursor, follower_id, following_id):
+    cursor.execute(
+        """
+        SELECT 1
+        FROM mg_social_follows
+        WHERE follower_id = %s
+          AND following_id = %s
+        LIMIT 1
+        """,
+        (follower_id, following_id),
+    )
+    return cursor.fetchone() is not None
+
+
+def privacy_can_view_profile(cursor, viewer_id, owner_id):
+    if str(viewer_id) == str(owner_id):
+        return True
+
+    if privacy_is_blocked(cursor, viewer_id, owner_id):
+        return False
+
+    cursor.execute(
+        """
+        SELECT profile_visibility
+        FROM mg_user_profiles
+        WHERE user_id = %s
+        """,
+        (owner_id,),
+    )
+    profile = cursor.fetchone()
+
+    if not profile:
+        return False
+
+    settings = privacy_get_settings(cursor, owner_id)
+
+    if profile["profile_visibility"] == "private":
+        return privacy_is_following(cursor, viewer_id, owner_id)
+
+    if settings["private_account"]:
+        return privacy_is_following(cursor, viewer_id, owner_id)
+
+    return True
+
+
+# ------------------------------------------------------------
+# ADMIN DATABASE MIGRATION
+# ------------------------------------------------------------
+
+@app.post("/api/v1/admin/migrations/privacy/apply")
+def apply_privacy_migration(
+    x_admin_key: Optional[str] = Header(None, alias="x-admin-key")
+):
+    configured_key = os.getenv("ADMIN_API_KEY")
+
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="کلید مدیریت در سرور تنظیم نشده است"
+        )
+
+    if not x_admin_key or not privacy_secrets.compare_digest(
+        str(x_admin_key),
+        str(configured_key)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="دسترسی مدیریت مجاز نیست"
+        )
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS mg_privacy_settings (
+            user_id UUID PRIMARY KEY REFERENCES mg_users(id) ON DELETE CASCADE,
+            private_account BOOLEAN NOT NULL DEFAULT FALSE,
+            allow_messages_from VARCHAR(20) NOT NULL DEFAULT 'everyone',
+            allow_comments_from VARCHAR(20) NOT NULL DEFAULT 'everyone',
+            show_followers BOOLEAN NOT NULL DEFAULT TRUE,
+            show_following BOOLEAN NOT NULL DEFAULT TRUE,
+            show_online_status BOOLEAN NOT NULL DEFAULT TRUE,
+            allow_search BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (allow_messages_from IN ('everyone','followers','nobody')),
+            CHECK (allow_comments_from IN ('everyone','followers','nobody'))
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mg_privacy_blocks (
+            id UUID PRIMARY KEY,
+            blocker_id UUID NOT NULL REFERENCES mg_users(id) ON DELETE CASCADE,
+            blocked_id UUID NOT NULL REFERENCES mg_users(id) ON DELETE CASCADE,
+            reason VARCHAR(300),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (blocker_id, blocked_id),
+            CHECK (blocker_id <> blocked_id)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_privacy_blocks_blocker
+        ON mg_privacy_blocks(blocker_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_privacy_blocks_blocked
+        ON mg_privacy_blocks(blocked_id)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mg_follow_requests (
+            id UUID PRIMARY KEY,
+            requester_id UUID NOT NULL REFERENCES mg_users(id) ON DELETE CASCADE,
+            target_id UUID NOT NULL REFERENCES mg_users(id) ON DELETE CASCADE,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reviewed_at TIMESTAMPTZ,
+            UNIQUE (requester_id, target_id),
+            CHECK (requester_id <> target_id),
+            CHECK (status IN ('pending','accepted','rejected','cancelled'))
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_follow_requests_target
+        ON mg_follow_requests(target_id, status, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_follow_requests_requester
+        ON mg_follow_requests(requester_id, created_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mg_security_events (
+            id BIGSERIAL PRIMARY KEY,
+            user_id UUID REFERENCES mg_users(id) ON DELETE SET NULL,
+            target_user_id UUID REFERENCES mg_users(id) ON DELETE SET NULL,
+            event_type VARCHAR(80) NOT NULL,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_security_events_user
+        ON mg_security_events(user_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_security_events_type
+        ON mg_security_events(event_type, created_at DESC)
+        """,
+    ]
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+
+    return {
+        "success": True,
+        "migration": "privacy_security_engine",
+        "version": PRIVACY_ENGINE_VERSION,
+        "message": "ساختار دیتابیس حریم خصوصی ایجاد شد"
+    }
+
+
+# ------------------------------------------------------------
+# PRIVACY SETTINGS
+# ------------------------------------------------------------
+
+@app.get("/api/v1/privacy/settings")
+def get_my_privacy_settings(
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+            settings = privacy_get_settings(cursor, user["id"])
+
+            return {
+                "success": True,
+                "settings": {
+                    "private_account": settings["private_account"],
+                    "allow_messages_from": settings["allow_messages_from"],
+                    "allow_comments_from": settings["allow_comments_from"],
+                    "show_followers": settings["show_followers"],
+                    "show_following": settings["show_following"],
+                    "show_online_status": settings["show_online_status"],
+                    "allow_search": settings["allow_search"],
+                }
+            }
+
+
+@app.patch("/api/v1/privacy/settings")
+def update_my_privacy_settings(
+    payload: PrivacySettingsUpdate,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    changes = payload.dict(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=400,
+            detail="هیچ تنظیمی برای تغییر ارسال نشده است"
+        )
+
+    allowed = {
+        "private_account",
+        "allow_messages_from",
+        "allow_comments_from",
+        "show_followers",
+        "show_following",
+        "show_online_status",
+        "allow_search",
+    }
+
+    if not set(changes).issubset(allowed):
+        raise HTTPException(status_code=400, detail="تنظیم نامعتبر است")
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+            privacy_get_settings(cursor, user["id"])
+
+            assignments = []
+            values = []
+
+            for key, value in changes.items():
+                assignments.append(key + " = %s")
+                values.append(value)
+
+            assignments.append("updated_at = NOW()")
+            values.append(user["id"])
+
+            cursor.execute(
+                """
+                UPDATE mg_privacy_settings
+                SET """ + ", ".join(assignments) + """
+                WHERE user_id = %s
+                RETURNING *
+                """,
+                tuple(values),
+            )
+
+            updated = cursor.fetchone()
+
+            if "private_account" in changes:
+                cursor.execute(
+                    """
+                    UPDATE mg_user_profiles
+                    SET profile_visibility = %s
+                    WHERE user_id = %s
+                    """,
+                    (
+                        "private" if changes["private_account"] else "public",
+                        user["id"],
+                    ),
+                )
+
+            privacy_log_event(
+                cursor,
+                user["id"],
+                "privacy_settings_updated",
+                metadata={"changed_fields": list(changes.keys())},
+            )
+
+    return {
+        "success": True,
+        "settings": {
+            key: updated[key]
+            for key in allowed
+        }
+    }
+
+
+# ------------------------------------------------------------
+# BLOCK / UNBLOCK
+# ------------------------------------------------------------
+
+@app.post("/api/v1/privacy/block")
+def block_global_user(
+    payload: PrivacyBlockRequest,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    target_id = privacy_uuid_value(payload.user_id)
+
+    if str(target_id) == str(user["id"]):
+        raise HTTPException(
+            status_code=400,
+            detail="نمی‌توانید حساب خودتان را مسدود کنید"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                "SELECT id FROM mg_users WHERE id = %s",
+                (target_id,),
+            )
+
+            if not cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="کاربر پیدا نشد"
+                )
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM mg_privacy_blocks
+                WHERE blocker_id = %s AND blocked_id = %s
+                """,
+                (user["id"], target_id),
+            )
+
+            if cursor.fetchone():
+                return {
+                    "success": True,
+                    "already_blocked": True
+                }
+
+            cursor.execute(
+                """
+                INSERT INTO mg_privacy_blocks
+                (id, blocker_id, blocked_id, reason)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    privacy_uuid.uuid4(),
+                    user["id"],
+                    target_id,
+                    payload.reason,
+                ),
+            )
+
+            cursor.execute(
+                """
+                DELETE FROM mg_follow_requests
+                WHERE (requester_id = %s AND target_id = %s)
+                   OR (requester_id = %s AND target_id = %s)
+                """,
+                (user["id"], target_id, target_id, user["id"]),
+            )
+
+            cursor.execute(
+                """
+                DELETE FROM mg_social_follows
+                WHERE (follower_id = %s AND following_id = %s)
+                   OR (follower_id = %s AND following_id = %s)
+                """,
+                (user["id"], target_id, target_id, user["id"]),
+            )
+
+            privacy_log_event(
+                cursor,
+                user["id"],
+                "user_blocked",
+                target_id,
+            )
+
+    return {
+        "success": True,
+        "blocked": True,
+        "user_id": str(target_id)
+    }
+
+
+@app.delete("/api/v1/privacy/block/{target_user_id}")
+def unblock_global_user(
+    target_user_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    target_id = privacy_uuid_value(target_user_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                DELETE FROM mg_privacy_blocks
+                WHERE blocker_id = %s AND blocked_id = %s
+                RETURNING id
+                """,
+                (user["id"], target_id),
+            )
+
+            removed = cursor.fetchone()
+
+            if removed:
+                privacy_log_event(
+                    cursor,
+                    user["id"],
+                    "user_unblocked",
+                    target_id,
+                )
+
+    return {
+        "success": True,
+        "unblocked": removed is not None
+    }
+
+
+@app.get("/api/v1/privacy/blocked")
+def list_blocked_users(
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT
+                    b.blocked_id,
+                    b.reason,
+                    b.created_at,
+                    p.display_name,
+                    p.avatar_url
+                FROM mg_privacy_blocks b
+                LEFT JOIN mg_user_profiles p
+                    ON p.user_id = b.blocked_id
+                WHERE b.blocker_id = %s
+                ORDER BY b.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user["id"], limit, offset),
+            )
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "user_id": str(row["blocked_id"]),
+                "display_name": row["display_name"],
+                "avatar_url": row["avatar_url"],
+                "reason": row["reason"],
+                "blocked_at": row["created_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+
+# ------------------------------------------------------------
+# FOLLOW REQUEST SYSTEM
+# ------------------------------------------------------------
+
+@app.post("/api/v1/privacy/follow/{target_user_id}")
+def privacy_follow_user(
+    target_user_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    target_id = privacy_uuid_value(target_user_id)
+
+    if str(target_id) == str(user["id"]):
+        raise HTTPException(status_code=400, detail="عملیات نامعتبر است")
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                "SELECT id FROM mg_users WHERE id = %s",
+                (target_id,),
+            )
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="کاربر پیدا نشد")
+
+            if privacy_is_blocked(cursor, user["id"], target_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="امکان دنبال‌کردن این حساب وجود ندارد"
+                )
+
+            if privacy_is_following(cursor, user["id"], target_id):
+                return {
+                    "success": True,
+                    "status": "already_following"
+                }
+
+            settings = privacy_get_settings(cursor, target_id)
+
+            if settings["private_account"]:
+                cursor.execute(
+                    """
+                    SELECT id, status
+                    FROM mg_follow_requests
+                    WHERE requester_id = %s AND target_id = %s
+                    """,
+                    (user["id"], target_id),
+                )
+
+                existing = cursor.fetchone()
+
+                if existing and existing["status"] == "pending":
+                    return {
+                        "success": True,
+                        "status": "pending"
+                    }
+
+                if existing:
+                    cursor.execute(
+                        """
+                        UPDATE mg_follow_requests
+                        SET status = 'pending',
+                            created_at = NOW(),
+                            reviewed_at = NULL
+                        WHERE id = %s
+                        """,
+                        (existing["id"],),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO mg_follow_requests
+                        (id, requester_id, target_id)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (privacy_uuid.uuid4(), user["id"], target_id),
+                    )
+
+                privacy_log_event(
+                    cursor,
+                    user["id"],
+                    "follow_request_sent",
+                    target_id,
+                )
+
+                return {
+                    "success": True,
+                    "status": "pending"
+                }
+
+            cursor.execute(
+                """
+                INSERT INTO mg_social_follows
+                (follower_id, following_id)
+                SELECT %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM mg_social_follows
+                    WHERE follower_id = %s AND following_id = %s
+                )
+                """,
+                (user["id"], target_id, user["id"], target_id),
+            )
+
+            privacy_log_event(
+                cursor,
+                user["id"],
+                "user_followed",
+                target_id,
+            )
+
+    return {
+        "success": True,
+        "status": "following"
+    }
+
+
+@app.get("/api/v1/privacy/follow-requests")
+def get_incoming_follow_requests(
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT
+                    r.id,
+                    r.requester_id,
+                    r.created_at,
+                    p.display_name,
+                    p.avatar_url
+                FROM mg_follow_requests r
+                LEFT JOIN mg_user_profiles p
+                    ON p.user_id = r.requester_id
+                WHERE r.target_id = %s
+                  AND r.status = 'pending'
+                ORDER BY r.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user["id"], limit, offset),
+            )
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "request_id": str(row["id"]),
+                "user_id": str(row["requester_id"]),
+                "display_name": row["display_name"],
+                "avatar_url": row["avatar_url"],
+                "created_at": row["created_at"].isoformat(),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/v1/privacy/follow-requests/{request_id}/decision")
+def decide_follow_request(
+    request_id: str,
+    payload: PrivacyFollowDecision,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    request_uuid = privacy_uuid_value(request_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT id, requester_id, target_id, status
+                FROM mg_follow_requests
+                WHERE id = %s AND target_id = %s
+                FOR UPDATE
+                """,
+                (request_uuid, user["id"]),
+            )
+
+            request_row = cursor.fetchone()
+
+            if not request_row or request_row["status"] != "pending":
+                raise HTTPException(
+                    status_code=404,
+                    detail="درخواست فعال پیدا نشد"
+                )
+
+            requester_id = request_row["requester_id"]
+
+            if privacy_is_blocked(cursor, user["id"], requester_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail="این ارتباط به دلیل مسدودسازی امکان‌پذیر نیست"
+                )
+
+            if payload.decision == "accept":
+                cursor.execute(
+                    """
+                    INSERT INTO mg_social_follows
+                    (follower_id, following_id)
+                    SELECT %s, %s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM mg_social_follows
+                        WHERE follower_id = %s AND following_id = %s
+                    )
+                    """,
+                    (
+                        requester_id,
+                        user["id"],
+                        requester_id,
+                        user["id"],
+                    ),
+                )
+
+                new_status = "accepted"
+            else:
+                new_status = "rejected"
+
+            cursor.execute(
+                """
+                UPDATE mg_follow_requests
+                SET status = %s, reviewed_at = NOW()
+                WHERE id = %s
+                """,
+                (new_status, request_uuid),
+            )
+
+            privacy_log_event(
+                cursor,
+                user["id"],
+                "follow_request_" + new_status,
+                requester_id,
+            )
+
+    return {
+        "success": True,
+        "status": new_status
+    }
+
+
+@app.delete("/api/v1/privacy/follow-requests/{request_id}")
+def cancel_follow_request(
+    request_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    request_uuid = privacy_uuid_value(request_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                UPDATE mg_follow_requests
+                SET status = 'cancelled',
+                    reviewed_at = NOW()
+                WHERE id = %s
+                  AND requester_id = %s
+                  AND status = 'pending'
+                RETURNING id
+                """,
+                (request_uuid, user["id"]),
+            )
+
+            removed = cursor.fetchone()
+
+    return {
+        "success": True,
+        "cancelled": removed is not None
+    }
+
+
+# ------------------------------------------------------------
+# PROFILE ACCESS CHECK
+# ------------------------------------------------------------
+
+@app.get("/api/v1/privacy/access/{target_user_id}")
+def check_profile_access(
+    target_user_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+    target_id = privacy_uuid_value(target_user_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                "SELECT id FROM mg_users WHERE id = %s",
+                (target_id,),
+            )
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="کاربر پیدا نشد")
+
+            allowed = privacy_can_view_profile(
+                cursor,
+                user["id"],
+                target_id,
+            )
+
+    return {
+        "success": True,
+        "can_view": allowed,
+        "user_id": str(target_id)
+    }
+
+
+# ------------------------------------------------------------
+# SECURITY EVENT HISTORY
+# ------------------------------------------------------------
+
+@app.get("/api/v1/privacy/security-events")
+def get_my_security_events(
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None)
+):
+    user = privacy_require_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            privacy_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    event_type,
+                    target_user_id,
+                    metadata,
+                    created_at
+                FROM mg_security_events
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user["id"], limit, offset),
+            )
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": row["id"],
+                "event": row["event_type"],
+                "target_user_id": (
+                    str(row["target_user_id"])
+                    if row["target_user_id"] else None
+                ),
+                "metadata": row["metadata"],
+                "created_at": row["created_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+
+# ============================================================
+# END SECTION 7
+# NEXT: GLOBAL MESSAGING PERMISSIONS & ANTI-SPAM ENGINE
+# ============================================================
