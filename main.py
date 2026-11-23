@@ -8427,3 +8427,324 @@ def get_storage_statistics(
 
 
 # END OF SECTION 13
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 14 — NOTIFICATION PREFERENCES ENGINE
+# ============================================================
+
+import json as np_json
+from typing import Optional
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException
+
+
+NP_VERSION = "14.0.0"
+
+NP_DEFAULTS = {
+    "enabled": True,
+    "messages": True,
+    "groups": True,
+    "calls": True,
+    "mentions": True,
+    "reactions": True,
+    "follows": True,
+    "security": True,
+    "marketing": False,
+    "sound": True,
+    "vibration": True,
+    "preview": True,
+    "quiet_mode": False,
+    "quiet_start": "22:00",
+    "quiet_end": "08:00"
+}
+
+NP_BOOL_FIELDS = {
+    "enabled", "messages", "groups", "calls",
+    "mentions", "reactions", "follows", "security",
+    "marketing", "sound", "vibration", "preview",
+    "quiet_mode"
+}
+
+
+class NotificationPreferencesUpdate(BaseModel):
+    preferences: dict = Field(default_factory=dict)
+
+
+def np_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def np_validate_time(value, field):
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid " + field
+        )
+
+    try:
+        datetime.strptime(value, "%H:%M")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Time must use HH:MM format"
+        )
+
+    return value
+
+
+def np_validate_preferences(data):
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Preferences must be an object"
+        )
+
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail="No preferences supplied"
+        )
+
+    result = {}
+
+    for key, value in data.items():
+        if key not in NP_DEFAULTS:
+            raise HTTPException(
+                status_code=422,
+                detail="Unknown preference: " + str(key)
+            )
+
+        if key in NP_BOOL_FIELDS:
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid boolean: " + key
+                )
+            result[key] = value
+
+        elif key in ("quiet_start", "quiet_end"):
+            result[key] = np_validate_time(value, key)
+
+    return result
+
+
+def np_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_notification_preferences (
+            user_id TEXT PRIMARY KEY,
+            preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+            revision BIGINT NOT NULL DEFAULT 1,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_notification_preferences_updated
+        ON mg_notification_preferences(updated_at DESC)
+    """)
+
+
+def np_load(cursor, user_id):
+    cursor.execute("""
+        SELECT preferences, revision, updated_at
+        FROM mg_notification_preferences
+        WHERE user_id = %s
+    """, (user_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        return {
+            "preferences": dict(NP_DEFAULTS),
+            "revision": 0,
+            "updated_at": None
+        }
+
+    stored = row[0]
+
+    if isinstance(stored, str):
+        try:
+            stored = np_json.loads(stored)
+        except (ValueError, TypeError):
+            stored = {}
+
+    if not isinstance(stored, dict):
+        stored = {}
+
+    merged = dict(NP_DEFAULTS)
+    merged.update(stored)
+
+    return {
+        "preferences": merged,
+        "revision": row[1],
+        "updated_at": (
+            row[2].isoformat() if row[2] else None
+        )
+    }
+
+
+@app.post("/api/v1/admin/migrations/notification-preferences/apply")
+def np_apply_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            np_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "NOTIFICATION PREFERENCES",
+        "version": NP_VERSION
+    }
+
+
+@app.get("/api/v1/notifications/preferences")
+def np_get_preferences(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = np_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            np_require_schema(cursor)
+            result = np_load(cursor, user_id)
+
+    return {
+        "success": True,
+        **result
+    }
+
+
+@app.patch("/api/v1/notifications/preferences")
+def np_update_preferences(
+    data: NotificationPreferencesUpdate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = np_user_id(user)
+
+    updates = np_validate_preferences(data.preferences)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            np_require_schema(cursor)
+
+            current = np_load(cursor, user_id)
+            merged = dict(current["preferences"])
+            merged.update(updates)
+
+            serialized = np_json.dumps(
+                merged,
+                ensure_ascii=False,
+                separators=(",", ":")
+            )
+
+            cursor.execute("""
+                INSERT INTO mg_notification_preferences (
+                    user_id, preferences, revision
+                )
+                VALUES (%s, %s::jsonb, 1)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    preferences = EXCLUDED.preferences,
+                    revision =
+                        mg_notification_preferences.revision + 1,
+                    updated_at = NOW()
+                RETURNING revision, updated_at
+            """, (user_id, serialized))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "preferences": merged,
+        "revision": row[0],
+        "updated_at": row[1].isoformat()
+    }
+
+
+@app.post("/api/v1/notifications/preferences/reset")
+def np_reset_preferences(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = np_user_id(user)
+
+    serialized = np_json.dumps(
+        NP_DEFAULTS,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            np_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg_notification_preferences (
+                    user_id, preferences, revision
+                )
+                VALUES (%s, %s::jsonb, 1)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    preferences = EXCLUDED.preferences,
+                    revision =
+                        mg_notification_preferences.revision + 1,
+                    updated_at = NOW()
+                RETURNING revision, updated_at
+            """, (user_id, serialized))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "preferences": dict(NP_DEFAULTS),
+        "revision": row[0],
+        "updated_at": row[1].isoformat()
+    }
+
+
+@app.delete("/api/v1/notifications/preferences")
+def np_delete_preferences(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = np_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            np_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_notification_preferences
+                WHERE user_id = %s
+            """, (user_id,))
+
+    return {
+        "success": True,
+        "preferences": dict(NP_DEFAULTS)
+    }
+
+
+# END OF SECTION 14
