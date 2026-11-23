@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "3.0.0"
 MIGRATION_VERSION = "001_initial_core"
 AUTH_MIGRATION_VERSION = "002_auth_engine"
 
@@ -5311,7 +5311,7 @@ def get_my_security_events(
 # ============================================================
 
 import hashlib as messaging_hashlib
-import uuid as messaging_uuid
+import uuid as messaging_uuid_lib
 
 from pydantic import BaseModel, Field
 
@@ -5358,7 +5358,7 @@ def messaging_user(authorization):
 
 def messaging_uuid(value):
     try:
-        return messaging_uuid.UUID(str(value))
+        return messaging_uuid_lib.UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(
             status_code=400,
@@ -13260,3 +13260,424 @@ def mg25_public_article_detail(slug: str):
 # ============================================================
 # END OF SECTIONS 24 + 25
 # ============================================================
+
+
+# ============================================================
+# MASIH GRAM GLOBAL ULTIMATE 3.0 — CORE MESSENGER + COMMUNITIES
+# Transactional direct messaging, groups, channels, reactions,
+# read receipts, edits, deletes, search and membership controls.
+# ============================================================
+
+class MGDirectMessageCreate(BaseModel):
+    recipient_id: str = Field(..., min_length=1, max_length=64)
+    content: str = Field(..., min_length=1, max_length=10000)
+    client_message_id: Optional[str] = Field(default=None, max_length=100)
+    reply_to_id: Optional[str] = Field(default=None, max_length=64)
+    message_type: str = Field(default="text", pattern="^text$")
+
+class MGMessageEdit(BaseModel):
+    content: str = Field(..., min_length=1, max_length=10000)
+
+class MGReactionCreate(BaseModel):
+    reaction: str = Field(..., min_length=1, max_length=32)
+
+class MGGroupCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    is_public: bool = False
+    member_ids: list[str] = Field(default_factory=list, max_length=100)
+
+class MGChannelCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    is_public: bool = True
+
+class MGCommunityMessage(BaseModel):
+    content: str = Field(..., min_length=1, max_length=10000)
+    client_message_id: Optional[str] = Field(default=None, max_length=100)
+
+class MGJoinRequest(BaseModel):
+    invite_code: Optional[str] = Field(default=None, max_length=100)
+
+
+def mg3_user(authorization):
+    user = get_authenticated_user(authorization)
+    if not user or not user.get("id"):
+        raise HTTPException(status_code=401, detail="احراز هویت معتبر نیست")
+    return user
+
+
+def mg3_uuid(value, label="شناسه"):
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"{label} معتبر نیست")
+
+
+def mg3_text(value, maximum=10000):
+    value = str(value or "").strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="متن پیام خالی است")
+    if len(value) > maximum:
+        raise HTTPException(status_code=413, detail="طول متن بیش از حد مجاز است")
+    return value
+
+
+@app.post("/api/v1/admin/migrations/messenger-core/apply")
+def mg3_apply_messenger_migration(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")):
+    verify_admin_key(x_admin_key)
+    statements = [
+        """CREATE TABLE IF NOT EXISTS public.mg_direct_messages (
+            id UUID PRIMARY KEY,
+            sender_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            recipient_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            message_type VARCHAR(20) NOT NULL DEFAULT 'text',
+            client_message_id VARCHAR(100),
+            reply_to_id UUID REFERENCES public.mg_direct_messages(id) ON DELETE SET NULL,
+            edited_at TIMESTAMPTZ,
+            deleted_for_sender BOOLEAN NOT NULL DEFAULT FALSE,
+            deleted_for_recipient BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK(sender_id <> recipient_id),
+            CHECK(message_type IN ('text','system'))
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS mg_dm_idempotency_idx ON public.mg_direct_messages(sender_id, client_message_id) WHERE client_message_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS mg_dm_sender_idx ON public.mg_direct_messages(sender_id, recipient_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS mg_dm_recipient_idx ON public.mg_direct_messages(recipient_id, sender_id, created_at DESC)",
+        """CREATE TABLE IF NOT EXISTS public.mg_direct_message_reads (
+            message_id UUID NOT NULL REFERENCES public.mg_direct_messages(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(message_id,user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS public.mg_direct_message_reactions (
+            message_id UUID NOT NULL REFERENCES public.mg_direct_messages(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            reaction VARCHAR(32) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(message_id,user_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS public.mg_communities (
+            id UUID PRIMARY KEY, owner_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            title VARCHAR(100) NOT NULL, description VARCHAR(1000),
+            community_type VARCHAR(16) NOT NULL,
+            is_public BOOLEAN NOT NULL DEFAULT FALSE,
+            invite_code VARCHAR(64) UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK(community_type IN ('group','channel'))
+        )""",
+        """CREATE TABLE IF NOT EXISTS public.mg_community_members (
+            community_id UUID NOT NULL REFERENCES public.mg_communities(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            role VARCHAR(16) NOT NULL DEFAULT 'member',
+            joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            muted_until TIMESTAMPTZ,
+            PRIMARY KEY(community_id,user_id),
+            CHECK(role IN ('owner','admin','member'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS mg_community_members_user_idx ON public.mg_community_members(user_id, joined_at DESC)",
+        """CREATE TABLE IF NOT EXISTS public.mg_community_messages (
+            id UUID PRIMARY KEY, community_id UUID NOT NULL REFERENCES public.mg_communities(id) ON DELETE CASCADE,
+            sender_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL, client_message_id VARCHAR(100),
+            edited_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS mg_community_msg_idem_idx ON public.mg_community_messages(sender_id,client_message_id) WHERE client_message_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS mg_community_msg_list_idx ON public.mg_community_messages(community_id,created_at DESC)",
+        """CREATE TABLE IF NOT EXISTS public.mg_community_message_reads (
+            message_id UUID NOT NULL REFERENCES public.mg_community_messages(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES public.mg_users(id) ON DELETE CASCADE,
+            read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(message_id,user_id)
+        )"""
+    ]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("masih_gram_messenger_core_v3",))
+            for statement in statements:
+                cur.execute(statement)
+    return {"success": True, "migration": "messenger_core_v3", "tables": 7, "message": "هسته پیام‌رسان و انجمن‌ها آماده شد"}
+
+
+def mg3_check_dm_access(cur, actor_id, other_id):
+    privacy_require_schema(cur)
+    if privacy_is_blocked(cur, actor_id, other_id):
+        raise HTTPException(status_code=403, detail="ارتباط بین این دو حساب به دلیل تنظیمات مسدودسازی مجاز نیست")
+    permission = messaging_check_permission(cur, actor_id, other_id)
+    if not permission["allowed"]:
+        raise HTTPException(status_code=403, detail={"code": permission["reason"], "message": "امکان ارسال پیام به این کاربر وجود ندارد"})
+
+
+def mg3_dm_json(row, actor_id):
+    partner_read_at = row[8].isoformat() if len(row) > 8 and row[8] else None
+    return {"id": str(row[0]), "sender_id": str(row[1]), "recipient_id": str(row[2]),
+            "content": row[3], "message_type": row[4], "reply_to_id": str(row[5]) if row[5] else None,
+            "edited_at": row[6].isoformat() if row[6] else None, "created_at": row[7].isoformat(),
+            "read_by_partner_at": partner_read_at,
+            "is_mine": str(row[1]) == str(actor_id)}
+
+
+@app.get("/api/v1/messaging/conversations")
+def mg3_list_conversations(limit: int = 50, offset: int = 0, authorization: Optional[str] = Header(None)):
+    user = mg3_user(authorization); limit=max(1,min(limit,100)); offset=max(0,offset)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""WITH latest AS (
+                SELECT DISTINCT ON (CASE WHEN sender_id=%s THEN recipient_id ELSE sender_id END)
+                CASE WHEN sender_id=%s THEN recipient_id ELSE sender_id END AS partner_id,
+                id, sender_id, recipient_id, content, created_at
+                FROM public.mg_direct_messages
+                WHERE (sender_id=%s AND deleted_for_sender=FALSE) OR (recipient_id=%s AND deleted_for_recipient=FALSE)
+                ORDER BY CASE WHEN sender_id=%s THEN recipient_id ELSE sender_id END, created_at DESC
+            ) SELECT l.partner_id,u.username,u.display_name,l.content,l.created_at,l.sender_id
+              FROM latest l JOIN public.mg_users u ON u.id=l.partner_id
+              ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
+              (user["id"],user["id"],user["id"],user["id"],user["id"],limit,offset))
+            rows=cur.fetchall()
+    return {"success":True,"conversations":[{"partner_id":str(r[0]),"username":r[1],"display_name":r[2],"last_message":r[3],"created_at":r[4].isoformat(),"last_message_mine":str(r[5])==user["id"]} for r in rows],"limit":limit,"offset":offset}
+
+
+@app.get("/api/v1/messaging/conversations/{partner_id}")
+def mg3_get_conversation(partner_id: str, limit: int = 100, before: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    user=mg3_user(authorization); other=mg3_uuid(partner_id,"شناسه مخاطب"); limit=max(1,min(limit,100))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            mg3_check_dm_access(cur,user["id"],other)
+            # Include the partner's read timestamp for messages sent by the current user.
+            params=[other,user["id"],other,user["id"],other]
+            sql="""SELECT m.id,m.sender_id,m.recipient_id,m.content,m.message_type,m.reply_to_id,m.edited_at,m.created_at,
+                          (SELECT r.read_at FROM public.mg_direct_message_reads r
+                           WHERE r.message_id=m.id AND r.user_id=%s) AS partner_read_at
+                   FROM public.mg_direct_messages m
+                   WHERE ((m.sender_id=%s AND m.recipient_id=%s AND m.deleted_for_sender=FALSE)
+                      OR (m.sender_id=%s AND m.recipient_id=%s AND m.deleted_for_recipient=FALSE))"""
+            if before:
+                sql += " AND created_at < %s"; params.append(before)
+            sql += " ORDER BY created_at DESC LIMIT %s"; params.append(limit)
+            cur.execute(sql,tuple(params)); rows=cur.fetchall()
+            cur.execute("""INSERT INTO public.mg_direct_message_reads(message_id,user_id)
+                SELECT id,%s FROM public.mg_direct_messages
+                WHERE sender_id=%s AND recipient_id=%s AND deleted_for_recipient=FALSE
+                ON CONFLICT(message_id,user_id) DO UPDATE SET read_at=NOW()""",(user["id"],other,user["id"]))
+    rows=list(reversed(rows))
+    return {"success":True,"partner_id":str(other),"messages":[mg3_dm_json(r,user["id"]) for r in rows]}
+
+
+@app.post("/api/v1/messaging/messages")
+def mg3_send_direct_message(payload: MGDirectMessageCreate, authorization: Optional[str] = Header(None)):
+    user=mg3_user(authorization); other=mg3_uuid(payload.recipient_id,"شناسه مخاطب"); content=mg3_text(payload.content)
+    reply=mg3_uuid(payload.reply_to_id,"شناسه پیام پاسخ") if payload.reply_to_id else None
+    new_id=uuid.uuid4()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.mg_direct_messages WHERE sender_id=%s AND client_message_id=%s",(user["id"],payload.client_message_id)) if payload.client_message_id else None
+            duplicate=cur.fetchone() if payload.client_message_id else None
+            if duplicate:
+                new_id=duplicate[0]
+            else:
+                mg3_check_dm_access(cur,user["id"],other)
+                messaging_require_schema(cur)
+                reservation=messaging_reserve_send(cur,user["id"],other,payload.client_message_id)
+                if reservation.get("duplicate"):
+                    raise HTTPException(status_code=409,detail="درخواست پیام تکراری است")
+                if reply:
+                    cur.execute("SELECT 1 FROM public.mg_direct_messages WHERE id=%s AND ((sender_id=%s AND recipient_id=%s) OR (sender_id=%s AND recipient_id=%s))",(reply,user["id"],other,other,user["id"]))
+                    if not cur.fetchone(): raise HTTPException(status_code=404,detail="پیام پاسخ پیدا نشد")
+                cur.execute("""INSERT INTO public.mg_direct_messages(id,sender_id,recipient_id,content,message_type,client_message_id,reply_to_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id,created_at""",
+                    (new_id,user["id"],other,content,payload.message_type,payload.client_message_id,reply))
+                row=cur.fetchone()
+                create_global_notification(cur,other,"message","پیام جدید",content[:160],user["id"],"direct_message",str(new_id))
+    return {"success":True,"message_id":str(new_id),"status":"sent","message":"پیام با موفقیت ثبت شد"}
+
+
+@app.patch("/api/v1/messaging/messages/{message_id}")
+def mg3_edit_direct_message(message_id: str,payload: MGMessageEdit,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); mid=mg3_uuid(message_id,"شناسه پیام"); content=mg3_text(payload.content)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE public.mg_direct_messages SET content=%s,edited_at=NOW() WHERE id=%s AND sender_id=%s AND created_at>NOW()-INTERVAL '48 hours' RETURNING id",(content,mid,user["id"]))
+            if not cur.fetchone(): raise HTTPException(status_code=404,detail="پیام قابل ویرایش پیدا نشد")
+    return {"success":True,"message":"پیام ویرایش شد"}
+
+
+@app.delete("/api/v1/messaging/messages/{message_id}")
+def mg3_delete_direct_message(message_id: str,for_everyone: bool=False,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); mid=mg3_uuid(message_id,"شناسه پیام")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT sender_id,recipient_id,created_at FROM public.mg_direct_messages WHERE id=%s",(mid,))
+            row=cur.fetchone()
+            if not row: raise HTTPException(status_code=404,detail="پیام پیدا نشد")
+            if str(user["id"])==str(row[0]):
+                if for_everyone:
+                    cur.execute("DELETE FROM public.mg_direct_messages WHERE id=%s AND created_at>NOW()-INTERVAL '48 hours' RETURNING id",(mid,))
+                    if not cur.fetchone():
+                        raise HTTPException(status_code=409,detail="مهلت حذف پیام برای همه (۴۸ ساعت) تمام شده است")
+                else:
+                    cur.execute("UPDATE public.mg_direct_messages SET deleted_for_sender=TRUE WHERE id=%s",(mid,))
+            elif str(user["id"])==str(row[1]):
+                if for_everyone:
+                    raise HTTPException(status_code=403,detail="فقط فرستنده می‌تواند پیام را برای همه حذف کند")
+                cur.execute("UPDATE public.mg_direct_messages SET deleted_for_recipient=TRUE WHERE id=%s",(mid,))
+            else:
+                raise HTTPException(status_code=403,detail="دسترسی مجاز نیست")
+    return {"success":True,"message":"پیام حذف شد"}
+
+
+@app.post("/api/v1/messaging/messages/{message_id}/reactions")
+def mg3_react_direct_message(message_id: str,payload: MGReactionCreate,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); mid=mg3_uuid(message_id,"شناسه پیام"); reaction=mg3_text(payload.reaction,32)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.mg_direct_messages WHERE id=%s AND (sender_id=%s OR recipient_id=%s)",(mid,user["id"],user["id"]))
+            if not cur.fetchone(): raise HTTPException(status_code=404,detail="پیام پیدا نشد")
+            cur.execute("INSERT INTO public.mg_direct_message_reactions(message_id,user_id,reaction) VALUES(%s,%s,%s) ON CONFLICT(message_id,user_id) DO UPDATE SET reaction=EXCLUDED.reaction,created_at=NOW()",(mid,user["id"],reaction))
+    return {"success":True,"reaction":reaction}
+
+
+@app.get("/api/v1/messaging/messages/{message_id}/reactions")
+def mg3_get_direct_reactions(message_id: str,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); mid=mg3_uuid(message_id,"شناسه پیام")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.mg_direct_messages WHERE id=%s AND (sender_id=%s OR recipient_id=%s)",(mid,user["id"],user["id"]))
+            if not cur.fetchone(): raise HTTPException(status_code=404,detail="پیام پیدا نشد")
+            cur.execute("SELECT user_id,reaction,created_at FROM public.mg_direct_message_reactions WHERE message_id=%s ORDER BY created_at",(mid,)); rows=cur.fetchall()
+    return {"success":True,"reactions":[{"user_id":str(r[0]),"reaction":r[1],"created_at":r[2].isoformat()} for r in rows]}
+
+
+@app.get("/api/v1/messaging/search")
+def mg3_search_messages(q: str,limit: int=50,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); q=mg3_text(q,200); limit=max(1,min(limit,100))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,sender_id,recipient_id,content,created_at FROM public.mg_direct_messages
+                WHERE (sender_id=%s OR recipient_id=%s) AND content ILIKE %s
+                AND ((sender_id=%s AND deleted_for_sender=FALSE) OR (recipient_id=%s AND deleted_for_recipient=FALSE))
+                ORDER BY created_at DESC LIMIT %s""",(user["id"],user["id"],"%"+q+"%",user["id"],user["id"],limit)); rows=cur.fetchall()
+    return {"success":True,"items":[{"id":str(r[0]),"sender_id":str(r[1]),"recipient_id":str(r[2]),"content":r[3],"created_at":r[4].isoformat()} for r in rows]}
+
+
+def mg3_community_create(user, payload, kind):
+    community_id=uuid.uuid4(); invite=secrets.token_urlsafe(18)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO public.mg_communities(id,owner_id,title,description,community_type,is_public,invite_code) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                (community_id,user["id"],payload.title.strip(),(payload.description or "").strip(),kind,payload.is_public,invite))
+            cur.execute("INSERT INTO public.mg_community_members(community_id,user_id,role) VALUES(%s,%s,'owner')",(community_id,user["id"]))
+            if kind=="group":
+                for raw in payload.member_ids:
+                    member=mg3_uuid(raw,"شناسه عضو")
+                    if str(member)==user["id"]: continue
+                    cur.execute("SELECT id FROM public.mg_users WHERE id=%s AND deleted_at IS NULL",(member,))
+                    if cur.fetchone():
+                        cur.execute("INSERT INTO public.mg_community_members(community_id,user_id,role) VALUES(%s,%s,'member') ON CONFLICT DO NOTHING",(community_id,member))
+    return {"success":True,"id":str(community_id),"title":payload.title,"type":kind,"invite_code":invite}
+
+
+@app.post("/api/v1/messaging/groups")
+def mg3_create_group(payload: MGGroupCreate,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); return mg3_community_create(user,payload,"group")
+
+
+@app.post("/api/v1/messaging/channels")
+def mg3_create_channel(payload: MGChannelCreate,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); return mg3_community_create(user,payload,"channel")
+
+
+@app.get("/api/v1/messaging/communities")
+def mg3_list_communities(kind: Optional[str]=None,limit: int=50,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); limit=max(1,min(limit,100))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT c.id,c.title,c.description,c.community_type,c.is_public,c.owner_id,c.created_at,
+                (SELECT COUNT(*) FROM public.mg_community_members m WHERE m.community_id=c.id) member_count,
+                (SELECT role FROM public.mg_community_members m WHERE m.community_id=c.id AND m.user_id=%s) my_role
+                FROM public.mg_communities c WHERE (c.is_public=TRUE OR EXISTS
+                (SELECT 1 FROM public.mg_community_members m WHERE m.community_id=c.id AND m.user_id=%s))
+                AND (%s IS NULL OR c.community_type=%s) ORDER BY c.created_at DESC LIMIT %s""",
+                (user["id"],user["id"],kind,kind,limit)); rows=cur.fetchall()
+    return {"success":True,"items":[{"id":str(r[0]),"title":r[1],"description":r[2],"type":r[3],"is_public":r[4],"owner_id":str(r[5]),"created_at":r[6].isoformat(),"member_count":r[7],"my_role":r[8]} for r in rows]}
+
+
+@app.post("/api/v1/messaging/communities/{community_id}/join")
+def mg3_join_community(community_id: str,payload: MGJoinRequest,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); cid=mg3_uuid(community_id,"شناسه انجمن")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_public,invite_code,community_type FROM public.mg_communities WHERE id=%s",(cid,)); row=cur.fetchone()
+            if not row: raise HTTPException(status_code=404,detail="گروه یا کانال پیدا نشد")
+            if not row[0] and (not payload.invite_code or not secrets.compare_digest(str(row[1]),payload.invite_code)):
+                raise HTTPException(status_code=403,detail="برای عضویت به لینک دعوت معتبر نیاز است")
+            cur.execute("INSERT INTO public.mg_community_members(community_id,user_id,role) VALUES(%s,%s,'member') ON CONFLICT DO NOTHING",(cid,user["id"]))
+    return {"success":True,"message":"عضویت ثبت شد"}
+
+
+@app.get("/api/v1/messaging/communities/{community_id}/messages")
+def mg3_get_community_messages(community_id: str,limit: int=100,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); cid=mg3_uuid(community_id,"شناسه انجمن"); limit=max(1,min(limit,100))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,user["id"]))
+            if not cur.fetchone(): raise HTTPException(status_code=403,detail="ابتدا باید عضو این گروه یا کانال شوی")
+            cur.execute("SELECT id,sender_id,content,edited_at,created_at FROM public.mg_community_messages WHERE community_id=%s AND deleted_at IS NULL ORDER BY created_at DESC LIMIT %s",(cid,limit)); rows=cur.fetchall()
+    rows=list(reversed(rows))
+    return {"success":True,"messages":[{"id":str(r[0]),"sender_id":str(r[1]),"content":r[2],"edited_at":r[3].isoformat() if r[3] else None,"created_at":r[4].isoformat(),"is_mine":str(r[1])==user["id"]} for r in rows]}
+
+
+@app.post("/api/v1/messaging/communities/{community_id}/messages")
+def mg3_send_community_message(community_id: str,payload: MGCommunityMessage,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); cid=mg3_uuid(community_id,"شناسه انجمن"); content=mg3_text(payload.content); mid=uuid.uuid4()
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,user["id"]))
+            member=cur.fetchone()
+            if not member: raise HTTPException(status_code=403,detail="عضویت در این انجمن الزامی است")
+            cur.execute("SELECT community_type FROM public.mg_communities WHERE id=%s",(cid,)); kind=cur.fetchone()[0]
+            if kind=="channel" and member[0] not in ("owner","admin"):
+                raise HTTPException(status_code=403,detail="فقط مدیران کانال می‌توانند پیام منتشر کنند")
+            if payload.client_message_id:
+                cur.execute("SELECT id FROM public.mg_community_messages WHERE sender_id=%s AND client_message_id=%s",(user["id"],payload.client_message_id)); duplicate=cur.fetchone()
+                if duplicate: return {"success":True,"message_id":str(duplicate[0]),"duplicate":True}
+            cur.execute("INSERT INTO public.mg_community_messages(id,community_id,sender_id,content,client_message_id) VALUES(%s,%s,%s,%s,%s)",(mid,cid,user["id"],content,payload.client_message_id))
+    return {"success":True,"message_id":str(mid),"status":"sent"}
+
+
+@app.get("/api/v1/messaging/communities/{community_id}/members")
+def mg3_community_members(community_id: str,limit: int=100,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); cid=mg3_uuid(community_id,"شناسه انجمن"); limit=max(1,min(limit,200))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,user["id"]))
+            if not cur.fetchone(): raise HTTPException(status_code=403,detail="دسترسی مجاز نیست")
+            cur.execute("SELECT u.id,u.username,u.display_name,m.role,m.joined_at FROM public.mg_community_members m JOIN public.mg_users u ON u.id=m.user_id WHERE m.community_id=%s ORDER BY m.joined_at LIMIT %s",(cid,limit)); rows=cur.fetchall()
+    return {"success":True,"members":[{"id":str(r[0]),"username":r[1],"display_name":r[2],"role":r[3],"joined_at":r[4].isoformat()} for r in rows]}
+
+
+@app.post("/api/v1/messaging/communities/{community_id}/members/{target_user_id}/remove")
+def mg3_remove_member(community_id: str,target_user_id: str,authorization: Optional[str]=Header(None)):
+    user=mg3_user(authorization); cid=mg3_uuid(community_id,"شناسه انجمن"); target=mg3_uuid(target_user_id,"شناسه عضو")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,user["id"]))
+            actor=cur.fetchone()
+            if not actor or actor[0] not in ("owner","admin"):
+                raise HTTPException(status_code=403,detail="فقط مدیر گروه می‌تواند عضو حذف کند")
+            cur.execute("SELECT role FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,target))
+            target_row=cur.fetchone()
+            if not target_row or target_row[0]=="owner":
+                raise HTTPException(status_code=404,detail="عضو پیدا نشد یا مالک گروه است")
+            if actor[0]=="admin" and target_row[0]=="admin":
+                raise HTTPException(status_code=403,detail="مدیر نمی‌تواند مدیر دیگر را حذف کند")
+            cur.execute("DELETE FROM public.mg_community_members WHERE community_id=%s AND user_id=%s",(cid,target))
+    return {"success":True,"message":"عضو حذف شد"}
+
+
+@app.get("/api/v1/messaging/engine/status")
+def mg3_messenger_status(authorization: Optional[str]=Header(None)):
+    mg3_user(authorization)
+    return {"success":True,"version":"3.0.0","modules":{"direct_messages":"implemented","conversations":"implemented","message_edit_delete":"implemented","reactions":"implemented","read_receipts":"implemented","message_search":"implemented","groups":"implemented","channels":"implemented","community_members":"implemented","attachments_binary_transfer":"not_implemented","websocket_realtime":"not_implemented","voice_video_calls":"not_implemented","e2ee":"not_implemented"}}
+
+# END MASIH GRAM MESSENGER CORE 3.0
