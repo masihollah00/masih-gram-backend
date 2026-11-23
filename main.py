@@ -9172,3 +9172,414 @@ def activity_admin_cleanup(
 
 
 # END OF SECTION 15
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 16 — USER DATA EXPORT ENGINE
+# ============================================================
+
+import json as export_json
+import uuid as export_uuid
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from fastapi import Header, HTTPException
+from pydantic import BaseModel, Field
+
+
+EXPORT_ENGINE_VERSION = "16.0.0"
+EXPORT_MAX_REQUESTS_PER_DAY = 3
+EXPORT_MAX_RECORDS_PER_TABLE = 5000
+
+
+class ExportRequestModel(BaseModel):
+    include_profile: bool = True
+    include_posts: bool = True
+    include_comments: bool = True
+    include_preferences: bool = True
+    include_activity: bool = True
+
+
+def export_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def export_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_data_export_requests (
+            id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'completed',
+            options JSONB NOT NULL DEFAULT '{}'::jsonb,
+            result JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMPTZ
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_data_export_user_created
+        ON mg_data_export_requests(user_id, created_at DESC)
+    """)
+
+
+def export_safe_rows(cursor, query, params, columns):
+    cursor.execute(query, params)
+    rows = cursor.fetchmany(EXPORT_MAX_RECORDS_PER_TABLE + 1)
+
+    if len(rows) > EXPORT_MAX_RECORDS_PER_TABLE:
+        raise HTTPException(
+            status_code=413,
+            detail="Export contains too many records"
+        )
+
+    result = []
+
+    for row in rows:
+        item = {}
+
+        for index, column in enumerate(columns):
+            value = row[index]
+
+            if isinstance(value, datetime):
+                value = value.isoformat()
+            elif isinstance(value, (dict, list)):
+                pass
+            elif hasattr(value, "hex") and not isinstance(value, str):
+                value = str(value)
+
+            item[column] = value
+
+        result.append(item)
+
+    return result
+
+
+@app.post("/api/v1/users/me/data-export")
+def export_create(
+    data: ExportRequestModel,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = export_user_id(user)
+
+    options = data.dict()
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            export_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM mg_data_export_requests
+                WHERE user_id = %s
+                  AND created_at >= NOW() - INTERVAL '1 day'
+            """, (user_id,))
+
+            if cursor.fetchone()[0] >= EXPORT_MAX_REQUESTS_PER_DAY:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Daily export request limit reached"
+                )
+
+            export_data = {
+                "format": "MASIH_GRAM_USER_EXPORT",
+                "version": EXPORT_ENGINE_VERSION,
+                "generated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "account": {
+                    "user_id": user_id
+                },
+                "data": {}
+            }
+
+            if data.include_profile:
+                cursor.execute("""
+                    SELECT
+                        display_name,
+                        bio,
+                        avatar_url,
+                        cover_url,
+                        language,
+                        timezone,
+                        profile_visibility
+                    FROM mg_user_profiles
+                    WHERE user_id = %s
+                """, (user_id,))
+
+                row = cursor.fetchone()
+
+                export_data["data"]["profile"] = (
+                    {
+                        "display_name": row[0],
+                        "bio": row[1],
+                        "avatar_url": row[2],
+                        "cover_url": row[3],
+                        "language": row[4],
+                        "timezone": row[5],
+                        "profile_visibility": row[6]
+                    } if row else None
+                )
+
+            if data.include_posts:
+                export_data["data"]["posts"] = export_safe_rows(
+                    cursor,
+                    """
+                    SELECT id, content, media_url,
+                           visibility, created_at
+                    FROM mg_social_posts
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (user_id, EXPORT_MAX_RECORDS_PER_TABLE),
+                    [
+                        "id", "content", "media_url",
+                        "visibility", "created_at"
+                    ]
+                )
+
+            if data.include_comments:
+                export_data["data"]["comments"] = export_safe_rows(
+                    cursor,
+                    """
+                    SELECT id, post_id, content, created_at
+                    FROM mg_social_comments
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (user_id, EXPORT_MAX_RECORDS_PER_TABLE),
+                    ["id", "post_id", "content", "created_at"]
+                )
+
+            if data.include_preferences:
+                cursor.execute("""
+                    SELECT preferences
+                    FROM mg_user_preferences
+                    WHERE user_id = %s
+                """, (user_id,))
+
+                row = cursor.fetchone()
+
+                export_data["data"]["preferences"] = (
+                    row[0] if row else {}
+                )
+
+                cursor.execute("""
+                    SELECT preferences
+                    FROM mg_notification_preferences
+                    WHERE user_id = %s
+                """, (user_id,))
+
+                row = cursor.fetchone()
+
+                export_data["data"]["notification_preferences"] = (
+                    row[0] if row else {}
+                )
+
+            if data.include_activity:
+                export_data["data"]["activity"] = export_safe_rows(
+                    cursor,
+                    """
+                    SELECT event_type, device_name, platform,
+                           app_version, created_at
+                    FROM mg_account_activity
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (user_id, EXPORT_MAX_RECORDS_PER_TABLE),
+                    [
+                        "event_type", "device_name",
+                        "platform", "app_version", "created_at"
+                    ]
+                )
+
+            request_id = str(export_uuid.uuid4())
+
+            cursor.execute("""
+                INSERT INTO mg_data_export_requests (
+                    id, user_id, status, options,
+                    result, completed_at
+                )
+                VALUES (
+                    %s, %s, 'completed',
+                    %s::jsonb, %s::jsonb, NOW()
+                )
+            """, (
+                request_id,
+                user_id,
+                export_json.dumps(options),
+                export_json.dumps(
+                    export_data,
+                    ensure_ascii=False,
+                    default=str
+                )
+            ))
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "status": "completed",
+        "format": "JSON",
+        "data": export_data
+    }
+
+
+@app.get("/api/v1/users/me/data-export/{request_id}")
+def export_get(
+    request_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = export_user_id(user)
+
+    try:
+        request_uuid = str(export_uuid.UUID(request_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid export request ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            export_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, status, options,
+                       result, created_at, completed_at
+                FROM mg_data_export_requests
+                WHERE id = %s AND user_id = %s
+            """, (request_uuid, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Export request not found"
+        )
+
+    return {
+        "success": True,
+        "request_id": str(row[0]),
+        "status": row[1],
+        "options": row[2],
+        "data": row[3],
+        "created_at": (
+            row[4].isoformat() if row[4] else None
+        ),
+        "completed_at": (
+            row[5].isoformat() if row[5] else None
+        )
+    }
+
+
+@app.get("/api/v1/users/me/data-exports")
+def export_list(
+    limit: int = 20,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = export_user_id(user)
+
+    if not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid pagination"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            export_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, status, options,
+                       created_at, completed_at
+                FROM mg_data_export_requests
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (user_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "items": [
+            {
+                "request_id": str(row[0]),
+                "status": row[1],
+                "options": row[2],
+                "created_at": (
+                    row[3].isoformat() if row[3] else None
+                ),
+                "completed_at": (
+                    row[4].isoformat() if row[4] else None
+                )
+            }
+            for row in rows
+        ],
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.delete("/api/v1/users/me/data-exports/{request_id}")
+def export_delete(
+    request_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = export_user_id(user)
+
+    try:
+        request_uuid = str(export_uuid.UUID(request_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid export request ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            export_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_data_export_requests
+                WHERE id = %s AND user_id = %s
+            """, (request_uuid, user_id))
+
+            deleted = cursor.rowcount
+
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Export request not found"
+        )
+
+    return {
+        "success": True,
+        "deleted": True
+    }
+
+
+# END OF SECTION 16
