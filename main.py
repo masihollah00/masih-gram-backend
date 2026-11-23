@@ -12458,3 +12458,625 @@ def mg23_usage_history(
 # ============================================================
 # END OF SECTION 23
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTIONS 24 + 25
+# CONTENT CATEGORIES & KNOWLEDGE CENTER
+# ============================================================
+
+import uuid as mg2425_uuid
+import re as mg2425_re
+from typing import Optional
+
+from fastapi import Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+
+MG2425_ARTICLE_STATUSES = {"draft", "published", "archived"}
+
+
+# ============================================================
+# SECTION 24 — CONTENT CATEGORY CENTER
+# ============================================================
+
+class MG24CategoryCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    slug: str = Field(..., min_length=2, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    sort_order: int = Field(default=0, ge=0, le=100000)
+
+
+def mg2425_require_admin(api_key):
+    global_admin_check(api_key)
+
+
+def mg2425_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg24_content_categories (
+            id UUID PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            slug VARCHAR(100) NOT NULL UNIQUE,
+            description VARCHAR(1000) NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg25_knowledge_articles (
+            id UUID PRIMARY KEY,
+            category_id UUID NOT NULL
+                REFERENCES mg24_content_categories(id)
+                ON DELETE RESTRICT,
+            title VARCHAR(200) NOT NULL,
+            slug VARCHAR(200) NOT NULL UNIQUE,
+            summary VARCHAR(1000) NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'published', 'archived')),
+            views_count BIGINT NOT NULL DEFAULT 0
+                CHECK (views_count >= 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            published_at TIMESTAMPTZ NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg24_categories_active_idx
+        ON mg24_content_categories (is_active, sort_order, name)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg25_articles_category_idx
+        ON mg25_knowledge_articles (category_id, status, published_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg25_articles_created_idx
+        ON mg25_knowledge_articles (created_at DESC)
+    """)
+
+
+def mg2425_row(cursor, row):
+    if row is None:
+        return None
+
+    columns = [column.name for column in cursor.description]
+    return dict(zip(columns, row))
+
+
+def mg2425_validate_slug(value):
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="Invalid slug")
+
+    value = value.strip().lower()
+
+    if not mg2425_re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
+        raise HTTPException(
+            status_code=422,
+            detail="Slug must contain lowercase English letters, numbers and hyphens"
+        )
+
+    return value
+
+
+def mg2425_clean(value, field_name):
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="Invalid " + field_name)
+
+    value = value.strip()
+
+    if not value:
+        raise HTTPException(status_code=422, detail=field_name + " cannot be empty")
+
+    return value
+
+
+# -------------------- SECTION 24 MIGRATION --------------------
+
+@app.post("/api/v1/admin/migrations/content-center/apply")
+def mg2425_apply_migration(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+    return {
+        "success": True,
+        "modules": [
+            "content_categories",
+            "knowledge_articles"
+        ],
+        "version": "24.25"
+    }
+
+
+# -------------------- CREATE CATEGORY --------------------
+
+@app.post("/api/v1/admin/content/categories")
+def mg24_create_category(
+    data: MG24CategoryCreate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    name = mg2425_clean(data.name, "name")
+    slug = mg2425_validate_slug(data.slug)
+    description = data.description.strip()
+
+    category_id = mg2425_uuid.uuid4()
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT 1
+                FROM mg24_content_categories
+                WHERE slug = %s
+            """, (slug,))
+
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Category slug already exists"
+                )
+
+            cursor.execute("""
+                INSERT INTO mg24_content_categories (
+                    id, name, slug, description, sort_order
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, name, slug, description,
+                          sort_order, is_active, created_at
+            """, (
+                category_id,
+                name,
+                slug,
+                description,
+                data.sort_order
+            ))
+
+            result = mg2425_row(cursor, cursor.fetchone())
+
+    return {"success": True, "category": result}
+
+
+# -------------------- ADMIN CATEGORY LIST --------------------
+
+@app.get("/api/v1/admin/content/categories")
+def mg24_admin_categories(
+    limit: int = Query(default=100, ge=1, le=300),
+    offset: int = Query(default=0, ge=0),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, name, slug, description,
+                       sort_order, is_active, created_at, updated_at
+                FROM mg24_content_categories
+                ORDER BY sort_order ASC, created_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+
+            rows = [
+                mg2425_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# -------------------- CATEGORY ACTIVE SWITCH --------------------
+
+@app.patch("/api/v1/admin/content/categories/{category_id}/active")
+def mg24_set_category_active(
+    category_id: str,
+    active: bool = Query(...),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    try:
+        parsed_id = mg2425_uuid.UUID(category_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid category ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg24_content_categories
+                SET is_active = %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, name, slug, is_active, updated_at
+            """, (active, parsed_id))
+
+            result = mg2425_row(cursor, cursor.fetchone())
+
+            if result is None:
+                raise HTTPException(status_code=404, detail="Category not found")
+
+    return {"success": True, "category": result}
+
+
+# -------------------- PUBLIC CATEGORY LIST --------------------
+
+@app.get("/api/v1/content/categories")
+def mg24_public_categories():
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    c.id,
+                    c.name,
+                    c.slug,
+                    c.description,
+                    c.sort_order,
+                    COUNT(a.id) AS published_articles
+                FROM mg24_content_categories c
+                LEFT JOIN mg25_knowledge_articles a
+                    ON a.category_id = c.id
+                    AND a.status = 'published'
+                WHERE c.is_active = TRUE
+                GROUP BY c.id
+                ORDER BY c.sort_order ASC, c.name ASC
+            """)
+
+            rows = [
+                mg2425_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# ============================================================
+# SECTION 25 — KNOWLEDGE ARTICLES CENTER
+# ============================================================
+
+class MG25ArticleCreate(BaseModel):
+    category_id: str
+    title: str = Field(..., min_length=2, max_length=200)
+    slug: str = Field(..., min_length=2, max_length=200)
+    summary: str = Field(default="", max_length=1000)
+    content: str = Field(..., min_length=2, max_length=50000)
+
+
+class MG25ArticleStatus(BaseModel):
+    status: str
+
+
+# -------------------- CREATE ARTICLE --------------------
+
+@app.post("/api/v1/admin/content/articles")
+def mg25_create_article(
+    data: MG25ArticleCreate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    try:
+        category_id = mg2425_uuid.UUID(data.category_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid category ID")
+
+    title = mg2425_clean(data.title, "title")
+    content = mg2425_clean(data.content, "content")
+    slug = mg2425_validate_slug(data.slug)
+    summary = data.summary.strip()
+
+    article_id = mg2425_uuid.uuid4()
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id
+                FROM mg24_content_categories
+                WHERE id = %s AND is_active = TRUE
+            """, (category_id,))
+
+            if cursor.fetchone() is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Active category not found"
+                )
+
+            cursor.execute("""
+                SELECT 1
+                FROM mg25_knowledge_articles
+                WHERE slug = %s
+            """, (slug,))
+
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Article slug already exists"
+                )
+
+            cursor.execute("""
+                INSERT INTO mg25_knowledge_articles (
+                    id, category_id, title, slug,
+                    summary, content, status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 'draft')
+                RETURNING id, category_id, title, slug,
+                          summary, status, views_count,
+                          created_at, updated_at
+            """, (
+                article_id,
+                category_id,
+                title,
+                slug,
+                summary,
+                content
+            ))
+
+            result = mg2425_row(cursor, cursor.fetchone())
+
+    return {"success": True, "article": result}
+
+
+# -------------------- ADMIN ARTICLE LIST --------------------
+
+@app.get("/api/v1/admin/content/articles")
+def mg25_admin_articles(
+    status: Optional[str] = Query(default=None),
+    category_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    if status is not None and status not in MG2425_ARTICLE_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid article status")
+
+    parsed_category = None
+
+    if category_id is not None:
+        try:
+            parsed_category = mg2425_uuid.UUID(category_id)
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=400, detail="Invalid category ID")
+
+    conditions = []
+    values = []
+
+    if status is not None:
+        conditions.append("a.status = %s")
+        values.append(status)
+
+    if parsed_category is not None:
+        conditions.append("a.category_id = %s")
+        values.append(parsed_category)
+
+    where_clause = ""
+    if conditions:
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+    values.extend([limit, offset])
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT a.id, a.category_id, c.name AS category_name,
+                       a.title, a.slug, a.summary, a.status,
+                       a.views_count, a.created_at,
+                       a.updated_at, a.published_at
+                FROM mg25_knowledge_articles a
+                JOIN mg24_content_categories c
+                    ON c.id = a.category_id
+            """ + where_clause + """
+                ORDER BY a.created_at DESC
+                LIMIT %s OFFSET %s
+            """, tuple(values))
+
+            rows = [
+                mg2425_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# -------------------- PUBLISH / ARCHIVE ARTICLE --------------------
+
+@app.patch("/api/v1/admin/content/articles/{article_id}/status")
+def mg25_change_article_status(
+    article_id: str,
+    data: MG25ArticleStatus,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg2425_require_admin(x_admin_api_key)
+
+    if data.status not in MG2425_ARTICLE_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid article status")
+
+    try:
+        parsed_id = mg2425_uuid.UUID(article_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid article ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg25_knowledge_articles
+                SET status = %s,
+                    published_at = CASE
+                        WHEN %s = 'published'
+                            THEN COALESCE(published_at, NOW())
+                        ELSE published_at
+                    END,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND (
+                      %s <> 'published'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM mg24_content_categories c
+                          WHERE c.id = mg25_knowledge_articles.category_id
+                            AND c.is_active = TRUE
+                      )
+                  )
+                RETURNING id, title, slug, status,
+                          published_at, updated_at
+            """, (
+                data.status,
+                data.status,
+                parsed_id,
+                data.status
+            ))
+
+            result = mg2425_row(cursor, cursor.fetchone())
+
+            if result is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Article or active category not found"
+                )
+
+    return {"success": True, "article": result}
+
+
+# -------------------- PUBLIC ARTICLE SEARCH --------------------
+
+@app.get("/api/v1/content/articles")
+def mg25_public_articles(
+    search: Optional[str] = Query(default=None, max_length=100),
+    category: Optional[str] = Query(default=None, max_length=100),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0)
+):
+    conditions = [
+        "a.status = 'published'",
+        "c.is_active = TRUE"
+    ]
+    values = []
+
+    if search:
+        search_text = search.strip()
+
+        if search_text:
+            conditions.append("""
+                (
+                    a.title ILIKE %s
+                    OR a.summary ILIKE %s
+                    OR a.content ILIKE %s
+                )
+            """)
+            pattern = "%" + search_text + "%"
+            values.extend([pattern, pattern, pattern])
+
+    if category:
+        conditions.append("c.slug = %s")
+        values.append(category.strip().lower())
+
+    values.extend([limit, offset])
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT a.id, a.title, a.slug, a.summary,
+                       a.category_id, c.name AS category_name,
+                       c.slug AS category_slug,
+                       a.views_count, a.published_at
+                FROM mg25_knowledge_articles a
+                JOIN mg24_content_categories c
+                    ON c.id = a.category_id
+                WHERE """ + " AND ".join(conditions) + """
+                ORDER BY a.published_at DESC NULLS LAST,
+                         a.created_at DESC
+                LIMIT %s OFFSET %s
+            """, tuple(values))
+
+            rows = [
+                mg2425_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# -------------------- PUBLIC ARTICLE DETAIL --------------------
+
+@app.get("/api/v1/content/articles/{slug}")
+def mg25_public_article_detail(slug: str):
+    if not mg2425_re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+        raise HTTPException(status_code=400, detail="Invalid article slug")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg2425_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg25_knowledge_articles a
+                SET views_count = a.views_count + 1
+                FROM mg24_content_categories c
+                WHERE a.category_id = c.id
+                  AND a.slug = %s
+                  AND a.status = 'published'
+                  AND c.is_active = TRUE
+                RETURNING
+                    a.id,
+                    a.title,
+                    a.slug,
+                    a.summary,
+                    a.content,
+                    a.views_count,
+                    a.published_at,
+                    c.id AS category_id,
+                    c.name AS category_name,
+                    c.slug AS category_slug
+            """, (slug,))
+
+            result = mg2425_row(cursor, cursor.fetchone())
+
+            if result is None:
+                raise HTTPException(status_code=404, detail="Article not found")
+
+    return {"success": True, "article": result}
+
+
+# ============================================================
+# END OF SECTIONS 24 + 25
+# ============================================================
