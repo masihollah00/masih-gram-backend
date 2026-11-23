@@ -10861,3 +10861,467 @@ def mg19_delete_config(
 
 
 # END OF SECTION 19
+
+# ============================================================
+# MASIH GRAM GLOBAL — SECTION 20
+# GLOBAL ANNOUNCEMENTS & SCHEDULED BROADCAST CENTER
+# ============================================================
+
+import uuid as mg20_uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+
+MG20_STATUSES = {"draft", "published", "paused", "archived"}
+MG20_TARGETS = {"all", "android", "ios"}
+
+
+# -------------------- MODELS --------------------
+
+class MG20AnnouncementCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=180)
+    body: str = Field(..., min_length=2, max_length=12000)
+    priority: int = Field(default=1, ge=1, le=5)
+    target: str = Field(default="all", max_length=20)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+
+
+class MG20AnnouncementUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=2, max_length=180)
+    body: Optional[str] = Field(default=None, min_length=2, max_length=12000)
+    priority: Optional[int] = Field(default=None, ge=1, le=5)
+    target: Optional[str] = Field(default=None, max_length=20)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+
+
+class MG20AnnouncementStatus(BaseModel):
+    status: str = Field(..., max_length=20)
+
+
+# -------------------- HELPERS --------------------
+
+def mg20_clean_text(value):
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="Invalid text")
+    value = value.strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="Text cannot be empty")
+    return value
+
+
+def mg20_validate_target(target):
+    if target not in MG20_TARGETS:
+        raise HTTPException(status_code=422, detail="Invalid announcement target")
+
+
+def mg20_validate_dates(starts_at, ends_at):
+    if starts_at is not None and ends_at is not None:
+        start = starts_at
+        end = ends_at
+
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+
+        if end <= start:
+            raise HTTPException(
+                status_code=422,
+                detail="ends_at must be later than starts_at"
+            )
+
+
+def mg20_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg20_announcements (
+            id UUID PRIMARY KEY,
+            title VARCHAR(180) NOT NULL,
+            body TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1
+                CHECK (priority BETWEEN 1 AND 5),
+            target VARCHAR(20) NOT NULL DEFAULT 'all'
+                CHECK (target IN ('all', 'android', 'ios')),
+            status VARCHAR(20) NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'published', 'paused', 'archived')),
+            starts_at TIMESTAMPTZ NULL,
+            ends_at TIMESTAMPTZ NULL,
+            views_count BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (ends_at IS NULL OR starts_at IS NULL OR ends_at > starts_at)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg20_announcements_public_idx
+        ON mg20_announcements (status, starts_at, ends_at, priority DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg20_announcements_created_idx
+        ON mg20_announcements (created_at DESC)
+    """)
+
+
+def mg20_row(cursor, row):
+    if row is None:
+        return None
+
+    names = [column.name for column in cursor.description]
+    return dict(zip(names, row))
+
+
+def mg20_announcement_not_found():
+    raise HTTPException(status_code=404, detail="Announcement not found")
+
+
+def mg20_check_admin(x_admin_api_key):
+    # Uses the existing MASIH GRAM administrator authentication.
+    global_admin_check(x_admin_api_key)
+
+
+# -------------------- MIGRATION --------------------
+
+@app.post("/api/v1/admin/migrations/announcements/apply")
+def mg20_apply_migration(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+    return {
+        "success": True,
+        "module": "global_announcements",
+        "version": "20.0"
+    }
+
+
+# -------------------- CREATE ANNOUNCEMENT --------------------
+
+@app.post("/api/v1/admin/announcements")
+def mg20_create_announcement(
+    data: MG20AnnouncementCreate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    title = mg20_clean_text(data.title)
+    body = mg20_clean_text(data.body)
+    mg20_validate_target(data.target)
+    mg20_validate_dates(data.starts_at, data.ends_at)
+
+    announcement_id = mg20_uuid.uuid4()
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg20_announcements (
+                    id, title, body, priority, target,
+                    status, starts_at, ends_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'draft', %s, %s)
+                RETURNING id, title, body, priority, target,
+                          status, starts_at, ends_at,
+                          views_count, created_at, updated_at
+            """, (
+                announcement_id,
+                title,
+                body,
+                data.priority,
+                data.target,
+                data.starts_at,
+                data.ends_at
+            ))
+
+            result = mg20_row(cursor, cursor.fetchone())
+
+    return {"success": True, "announcement": result}
+
+
+# -------------------- ADMIN ANNOUNCEMENT LIST --------------------
+
+@app.get("/api/v1/admin/announcements")
+def mg20_admin_announcements(
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    if status is not None and status not in MG20_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid status")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            if status is None:
+                cursor.execute("""
+                    SELECT id, title, body, priority, target,
+                           status, starts_at, ends_at,
+                           views_count, created_at, updated_at
+                    FROM mg20_announcements
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (limit, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, title, body, priority, target,
+                           status, starts_at, ends_at,
+                           views_count, created_at, updated_at
+                    FROM mg20_announcements
+                    WHERE status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (status, limit, offset))
+
+            rows = [mg20_row(cursor, row) for row in cursor.fetchall()]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "items": rows
+    }
+
+
+# -------------------- UPDATE ANNOUNCEMENT --------------------
+
+@app.patch("/api/v1/admin/announcements/{announcement_id}")
+def mg20_update_announcement(
+    announcement_id: str,
+    data: MG20AnnouncementUpdate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    try:
+        parsed_id = mg20_uuid.UUID(announcement_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid announcement ID")
+
+    changes = data.dict(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="No update fields provided")
+
+    allowed_fields = {
+        "title", "body", "priority", "target",
+        "starts_at", "ends_at"
+    }
+
+    for key in list(changes.keys()):
+        if key not in allowed_fields:
+            raise HTTPException(status_code=422, detail="Invalid update field")
+
+    if "title" in changes and changes["title"] is not None:
+        changes["title"] = mg20_clean_text(changes["title"])
+
+    if "body" in changes and changes["body"] is not None:
+        changes["body"] = mg20_clean_text(changes["body"])
+
+    if "target" in changes and changes["target"] is not None:
+        mg20_validate_target(changes["target"])
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT starts_at, ends_at
+                FROM mg20_announcements
+                WHERE id = %s
+                FOR UPDATE
+            """, (parsed_id,))
+
+            current = cursor.fetchone()
+
+            if current is None:
+                mg20_announcement_not_found()
+
+            new_start = changes.get("starts_at", current[0])
+            new_end = changes.get("ends_at", current[1])
+
+            mg20_validate_dates(new_start, new_end)
+
+            assignments = []
+            values = []
+
+            for key, value in changes.items():
+                assignments.append(key + " = %s")
+                values.append(value)
+
+            assignments.append("updated_at = NOW()")
+            values.append(parsed_id)
+
+            query = (
+                "UPDATE mg20_announcements SET "
+                + ", ".join(assignments)
+                + " WHERE id = %s "
+                + "RETURNING id, title, body, priority, target, status, "
+                + "starts_at, ends_at, views_count, created_at, updated_at"
+            )
+
+            cursor.execute(query, tuple(values))
+            result = mg20_row(cursor, cursor.fetchone())
+
+    return {"success": True, "announcement": result}
+
+
+# -------------------- PUBLISH / PAUSE / ARCHIVE --------------------
+
+@app.patch("/api/v1/admin/announcements/{announcement_id}/status")
+def mg20_change_announcement_status(
+    announcement_id: str,
+    data: MG20AnnouncementStatus,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    if data.status not in MG20_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid status")
+
+    try:
+        parsed_id = mg20_uuid.UUID(announcement_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid announcement ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg20_announcements
+                SET status = %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, title, status, starts_at, ends_at,
+                          views_count, updated_at
+            """, (data.status, parsed_id))
+
+            result = mg20_row(cursor, cursor.fetchone())
+
+            if result is None:
+                mg20_announcement_not_found()
+
+    return {"success": True, "announcement": result}
+
+
+# -------------------- PUBLIC ANNOUNCEMENTS --------------------
+
+@app.get("/api/v1/announcements")
+def mg20_public_announcements(
+    platform: str = Query(default="all"),
+    limit: int = Query(default=20, ge=1, le=100)
+):
+    if platform not in MG20_TARGETS:
+        raise HTTPException(status_code=422, detail="Invalid platform")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, title, body, priority, target,
+                       starts_at, ends_at, created_at
+                FROM mg20_announcements
+                WHERE status = 'published'
+                  AND (starts_at IS NULL OR starts_at <= NOW())
+                  AND (ends_at IS NULL OR ends_at > NOW())
+                  AND (target = 'all' OR target = %s)
+                ORDER BY priority DESC, created_at DESC
+                LIMIT %s
+            """, (platform, limit))
+
+            rows = [mg20_row(cursor, row) for row in cursor.fetchall()]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# -------------------- PUBLIC ANNOUNCEMENT DETAIL --------------------
+
+@app.get("/api/v1/announcements/{announcement_id}")
+def mg20_public_announcement_detail(announcement_id: str):
+    try:
+        parsed_id = mg20_uuid.UUID(announcement_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid announcement ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg20_announcements
+                SET views_count = views_count + 1
+                WHERE id = %s
+                  AND status = 'published'
+                  AND (starts_at IS NULL OR starts_at <= NOW())
+                  AND (ends_at IS NULL OR ends_at > NOW())
+                RETURNING id, title, body, priority, target,
+                          starts_at, ends_at, views_count, created_at
+            """, (parsed_id,))
+
+            result = mg20_row(cursor, cursor.fetchone())
+
+            if result is None:
+                mg20_announcement_not_found()
+
+    return {"success": True, "announcement": result}
+
+
+# -------------------- DELETE / ARCHIVE --------------------
+
+@app.delete("/api/v1/admin/announcements/{announcement_id}")
+def mg20_delete_announcement(
+    announcement_id: str,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg20_check_admin(x_admin_api_key)
+
+    try:
+        parsed_id = mg20_uuid.UUID(announcement_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid announcement ID")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg20_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg20_announcements
+                SET status = 'archived', updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, status
+            """, (parsed_id,))
+
+            result = mg20_row(cursor, cursor.fetchone())
+
+            if result is None:
+                mg20_announcement_not_found()
+
+    return {
+        "success": True,
+        "message": "Announcement archived",
+        "announcement": result
+    }
+
+
+# ============================================================
+# END OF SECTION 20
+# ============================================================
