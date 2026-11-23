@@ -8748,3 +8748,427 @@ def np_delete_preferences(
 
 
 # END OF SECTION 14
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 15 — ACCOUNT ACTIVITY HISTORY ENGINE
+# ============================================================
+
+import uuid as activity_uuid_lib
+import re as activity_re
+from typing import Optional
+from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+ACTIVITY_ENGINE_VERSION = "15.0.0"
+ACTIVITY_MAX_PAGE_SIZE = 100
+
+ACTIVITY_ALLOWED_TYPES = {
+    "login",
+    "logout",
+    "login_failed",
+    "password_changed",
+    "profile_updated",
+    "device_registered",
+    "device_revoked",
+    "session_revoked",
+    "security_alert"
+}
+
+
+class ActivityCreateRequest(BaseModel):
+    event_type: str
+    device_name: Optional[str] = None
+    platform: Optional[str] = None
+    app_version: Optional[str] = None
+    details: Optional[dict] = None
+
+
+def activity_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def activity_clean_text(value, maximum=120):
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid text value"
+        )
+
+    value = value.strip()
+
+    if len(value) > maximum:
+        raise HTTPException(
+            status_code=422,
+            detail="Text value is too long"
+        )
+
+    return value or None
+
+
+def activity_validate_details(details):
+    if details is None:
+        return {}
+
+    if not isinstance(details, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Details must be an object"
+        )
+
+    # Avoid storing arbitrary or sensitive client data.
+    allowed = {
+        "method",
+        "source",
+        "reason",
+        "location_label"
+    }
+
+    result = {}
+
+    for key, value in details.items():
+        if key not in allowed:
+            continue
+
+        if not isinstance(value, (str, int, bool)):
+            continue
+
+        if isinstance(value, str):
+            value = value.strip()[:160]
+
+        result[key] = value
+
+    return result
+
+
+def activity_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_account_activity (
+            id BIGSERIAL PRIMARY KEY,
+            event_id UUID NOT NULL UNIQUE,
+            user_id TEXT NOT NULL,
+            event_type VARCHAR(40) NOT NULL,
+            device_name VARCHAR(120),
+            platform VARCHAR(40),
+            app_version VARCHAR(40),
+            ip_address INET,
+            user_agent TEXT,
+            details JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_account_activity_user_created
+        ON mg_account_activity(user_id, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_account_activity_type_created
+        ON mg_account_activity(event_type, created_at DESC)
+    """)
+
+
+def activity_record(
+    cursor,
+    user_id,
+    event_type,
+    device_name=None,
+    platform=None,
+    app_version=None,
+    ip_address=None,
+    user_agent=None,
+    details=None
+):
+    if event_type not in ACTIVITY_ALLOWED_TYPES:
+        raise ValueError("Unsupported activity event type")
+
+    cursor.execute("""
+        INSERT INTO mg_account_activity (
+            event_id,
+            user_id,
+            event_type,
+            device_name,
+            platform,
+            app_version,
+            ip_address,
+            user_agent,
+            details
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s::jsonb
+        )
+        RETURNING id, event_id, created_at
+    """, (
+        str(activity_uuid_lib.uuid4()),
+        str(user_id),
+        event_type,
+        activity_clean_text(device_name),
+        activity_clean_text(platform, 40),
+        activity_clean_text(app_version, 40),
+        ip_address,
+        activity_clean_text(user_agent, 500),
+        activity_json.dumps(
+            activity_validate_details(details),
+            ensure_ascii=False
+        )
+    ))
+
+    return cursor.fetchone()
+
+
+@app.post("/api/v1/admin/migrations/account-activity/apply")
+def activity_apply_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "ACCOUNT ACTIVITY HISTORY",
+        "version": ACTIVITY_ENGINE_VERSION
+    }
+
+
+@app.post("/api/v1/account/activity")
+def activity_create(
+    data: ActivityCreateRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = activity_user_id(user)
+
+    if data.event_type not in ACTIVITY_ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported activity event type"
+        )
+
+    # Clients may report ordinary activity only.
+    # Security-critical events must be recorded by trusted
+    # authentication and session-management code.
+    client_allowed = {
+        "profile_updated",
+        "device_registered"
+    }
+
+    if data.event_type not in client_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="This event must be recorded by the server"
+        )
+
+    forwarded = request.headers.get("x-forwarded-for")
+    ip_address = (
+        forwarded.split(",")[0].strip()
+        if forwarded else (
+            request.client.host if request.client else None
+        )
+    )
+
+    if ip_address:
+        try:
+            import ipaddress
+            ip_address = str(ipaddress.ip_address(ip_address))
+        except ValueError:
+            ip_address = None
+
+    user_agent = request.headers.get("user-agent")
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+            row = activity_record(
+                cursor=cursor,
+                user_id=user_id,
+                event_type=data.event_type,
+                device_name=data.device_name,
+                platform=data.platform,
+                app_version=data.app_version,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                details=data.details
+            )
+
+    return {
+        "success": True,
+        "event_id": str(row[1]),
+        "created_at": row[2].isoformat()
+    }
+
+
+@app.get("/api/v1/account/activity")
+def activity_list(
+    event_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = activity_user_id(user)
+
+    if event_type and event_type not in ACTIVITY_ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid event type"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+            if event_type:
+                cursor.execute("""
+                    SELECT
+                        id, event_id, event_type,
+                        device_name, platform, app_version,
+                        ip_address::text, user_agent,
+                        details, created_at
+                    FROM mg_account_activity
+                    WHERE user_id = %s
+                      AND event_type = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s OFFSET %s
+                """, (
+                    user_id,
+                    event_type,
+                    limit,
+                    offset
+                ))
+            else:
+                cursor.execute("""
+                    SELECT
+                        id, event_id, event_type,
+                        device_name, platform, app_version,
+                        ip_address::text, user_agent,
+                        details, created_at
+                    FROM mg_account_activity
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s OFFSET %s
+                """, (
+                    user_id,
+                    limit,
+                    offset
+                ))
+
+            rows = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM mg_account_activity
+                WHERE user_id = %s
+                  AND (%s IS NULL OR event_type = %s)
+            """, (
+                user_id,
+                event_type,
+                event_type
+            ))
+
+            total = cursor.fetchone()[0]
+
+    items = []
+
+    for row in rows:
+        items.append({
+            "id": row[0],
+            "event_id": str(row[1]),
+            "event_type": row[2],
+            "device_name": row[3],
+            "platform": row[4],
+            "app_version": row[5],
+            "ip_address": row[6],
+            "user_agent": row[7],
+            "details": row[8],
+            "created_at": (
+                row[9].isoformat() if row[9] else None
+            )
+        })
+
+    return {
+        "success": True,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items
+    }
+
+
+@app.delete("/api/v1/account/activity")
+def activity_clear_own(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = activity_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_account_activity
+                WHERE user_id = %s
+            """, (user_id,))
+
+            deleted = cursor.rowcount
+
+    return {
+        "success": True,
+        "deleted_count": deleted
+    }
+
+
+@app.post("/api/v1/admin/account-activity/cleanup")
+def activity_admin_cleanup(
+    days: int = Query(default=365, ge=30, le=3650),
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            activity_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_account_activity
+                WHERE created_at < NOW() - (%s * INTERVAL '1 day')
+            """, (days,))
+
+            deleted = cursor.rowcount
+
+    return {
+        "success": True,
+        "retention_days": days,
+        "deleted_count": deleted
+    }
+
+
+# END OF SECTION 15
