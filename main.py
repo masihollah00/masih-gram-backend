@@ -7127,3 +7127,427 @@ def get_audit_statistics(
     }
 
 # END OF SECTION 10
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 11 — USER PREFERENCES ENGINE
+# ============================================================
+
+import json as preferences_json
+
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException
+from typing import Optional
+
+
+PREFERENCES_ENGINE_VERSION = "11.0.0"
+
+PREFERENCES_DEFAULTS = {
+    "theme": "dark",
+    "language": "fa",
+    "font_size": "medium",
+    "notifications_enabled": True,
+    "message_preview": True,
+    "sound_enabled": True,
+    "vibration_enabled": True,
+    "read_receipts": True,
+    "online_status": True,
+    "last_seen_visibility": "contacts",
+    "media_auto_download": "wifi",
+    "animations_enabled": True,
+    "chat_background": "default",
+    "enter_to_send": False,
+    "data_saver": False
+}
+
+PREFERENCES_ALLOWED = set(PREFERENCES_DEFAULTS.keys())
+
+
+class PreferencesUpdateRequest(BaseModel):
+    preferences: dict = Field(default_factory=dict)
+
+
+class PreferencesResetRequest(BaseModel):
+    confirm: bool = False
+
+
+def preferences_extract_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def preferences_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_user_preferences (
+            user_id TEXT PRIMARY KEY,
+            preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_user_preferences_updated
+        ON mg_user_preferences(updated_at DESC)
+    """)
+
+
+def preferences_validate(data):
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Preferences must be an object"
+        )
+
+    if len(data) > len(PREFERENCES_ALLOWED):
+        raise HTTPException(
+            status_code=400,
+            detail="Too many preference fields"
+        )
+
+    result = {}
+
+    for key, value in data.items():
+        if key not in PREFERENCES_ALLOWED:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported preference: " + str(key)
+            )
+
+        default = PREFERENCES_DEFAULTS[key]
+
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid boolean preference: " + key
+                )
+
+        elif key == "theme":
+            if value not in ("dark", "light", "system"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid theme"
+                )
+
+        elif key == "language":
+            if value not in ("fa", "en", "az", "ar", "tr"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Unsupported language"
+                )
+
+        elif key == "font_size":
+            if value not in ("small", "medium", "large"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid font size"
+                )
+
+        elif key == "last_seen_visibility":
+            if value not in ("everyone", "contacts", "nobody"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid last seen visibility"
+                )
+
+        elif key == "media_auto_download":
+            if value not in ("never", "wifi", "always"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid media download setting"
+                )
+
+        elif key == "chat_background":
+            if not isinstance(value, str) or len(value) > 100:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid chat background"
+                )
+
+        result[key] = value
+
+    return result
+
+
+def preferences_load(cursor, user_id):
+    cursor.execute("""
+        SELECT preferences, version, updated_at
+        FROM mg_user_preferences
+        WHERE user_id = %s
+    """, (user_id,))
+
+    row = cursor.fetchone()
+
+    if not row:
+        return {
+            "preferences": dict(PREFERENCES_DEFAULTS),
+            "version": 0,
+            "updated_at": None
+        }
+
+    stored = row[0]
+
+    if isinstance(stored, str):
+        try:
+            stored = preferences_json.loads(stored)
+        except Exception:
+            stored = {}
+
+    if not isinstance(stored, dict):
+        stored = {}
+
+    merged = dict(PREFERENCES_DEFAULTS)
+    merged.update(stored)
+
+    return {
+        "preferences": merged,
+        "version": row[1],
+        "updated_at": (
+            row[2].isoformat() if row[2] else None
+        )
+    }
+
+
+@app.post("/api/v1/admin/migrations/preferences/apply")
+def apply_preferences_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "USER PREFERENCES",
+        "version": PREFERENCES_ENGINE_VERSION
+    }
+
+
+@app.get("/api/v1/users/me/preferences")
+def get_my_preferences(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = preferences_extract_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+            result = preferences_load(cursor, user_id)
+
+    return {
+        "success": True,
+        **result
+    }
+
+
+@app.patch("/api/v1/users/me/preferences")
+def update_my_preferences(
+    data: PreferencesUpdateRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = preferences_extract_user_id(user)
+
+    updates = preferences_validate(data.preferences)
+
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail="No preference changes supplied"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+            current = preferences_load(cursor, user_id)
+            merged = dict(current["preferences"])
+            merged.update(updates)
+
+            serialized = preferences_json.dumps(
+                merged,
+                ensure_ascii=False,
+                separators=(",", ":")
+            )
+
+            cursor.execute("""
+                INSERT INTO mg_user_preferences (
+                    user_id,
+                    preferences,
+                    version
+                )
+                VALUES (%s, %s::jsonb, 1)
+
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    preferences = EXCLUDED.preferences,
+                    version = mg_user_preferences.version + 1,
+                    updated_at = NOW()
+
+                RETURNING version, updated_at
+            """, (user_id, serialized))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "preferences": merged,
+        "version": row[0],
+        "updated_at": row[1].isoformat()
+    }
+
+
+@app.post("/api/v1/users/me/preferences/reset")
+def reset_my_preferences(
+    data: PreferencesResetRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = preferences_extract_user_id(user)
+
+    if data.confirm is not True:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit confirmation required"
+        )
+
+    serialized = preferences_json.dumps(
+        PREFERENCES_DEFAULTS,
+        ensure_ascii=False
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg_user_preferences (
+                    user_id,
+                    preferences,
+                    version
+                )
+                VALUES (%s, %s::jsonb, 1)
+
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    preferences = EXCLUDED.preferences,
+                    version = mg_user_preferences.version + 1,
+                    updated_at = NOW()
+
+                RETURNING version, updated_at
+            """, (user_id, serialized))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "message": "Preferences reset successfully",
+        "preferences": dict(PREFERENCES_DEFAULTS),
+        "version": row[0],
+        "updated_at": row[1].isoformat()
+    }
+
+
+@app.delete("/api/v1/users/me/preferences")
+def delete_my_custom_preferences(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = preferences_extract_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg_user_preferences
+                WHERE user_id = %s
+            """, (user_id,))
+
+    return {
+        "success": True,
+        "message": "Custom preferences removed",
+        "preferences": dict(PREFERENCES_DEFAULTS)
+    }
+
+
+@app.get("/api/v1/admin/preferences/statistics")
+def get_preferences_statistics(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            preferences_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*) AS total_users,
+                    COUNT(*) FILTER (
+                        WHERE updated_at >= NOW() - INTERVAL '24 hours'
+                    ) AS recently_updated
+                FROM mg_user_preferences
+            """)
+
+            summary = cursor.fetchone()
+
+            cursor.execute("""
+                SELECT
+                    preferences->>'theme' AS theme,
+                    COUNT(*) AS total
+                FROM mg_user_preferences
+                GROUP BY preferences->>'theme'
+                ORDER BY total DESC
+            """)
+
+            themes = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT
+                    preferences->>'language' AS language,
+                    COUNT(*) AS total
+                FROM mg_user_preferences
+                GROUP BY preferences->>'language'
+                ORDER BY total DESC
+            """)
+
+            languages = cursor.fetchall()
+
+    return {
+        "success": True,
+        "statistics": {
+            "total_users": summary[0],
+            "recently_updated": summary[1]
+        },
+        "themes": [
+            {"theme": row[0], "users": row[1]}
+            for row in themes
+        ],
+        "languages": [
+            {"language": row[0], "users": row[1]}
+            for row in languages
+        ]
+    }
+
+# END OF SECTION 11
