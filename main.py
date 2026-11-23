@@ -12039,3 +12039,422 @@ def mg22_archive_release(
 # ============================================================
 # END OF SECTION 22
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL — SECTION 23
+# GLOBAL QUOTA & USAGE CONTROL
+# ============================================================
+
+import uuid as mg23_uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+
+# -------------------- MODELS --------------------
+
+class MG23QuotaCreate(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=100)
+    daily_requests: int = Field(default=1000, ge=0, le=10000000)
+    monthly_requests: int = Field(default=30000, ge=0, le=300000000)
+    storage_limit_bytes: int = Field(default=104857600, ge=0)
+    upload_limit_bytes: int = Field(default=10485760, ge=0)
+
+
+class MG23UsageReport(BaseModel):
+    resource: str = Field(..., min_length=2, max_length=40)
+    amount: int = Field(..., gt=0, le=1000000000000)
+
+
+class MG23QuotaUpdate(BaseModel):
+    daily_requests: Optional[int] = Field(default=None, ge=0, le=10000000)
+    monthly_requests: Optional[int] = Field(default=None, ge=0, le=300000000)
+    storage_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    upload_limit_bytes: Optional[int] = Field(default=None, ge=0)
+
+
+# -------------------- CONSTANTS --------------------
+
+MG23_RESOURCES = {
+    "requests",
+    "storage_bytes",
+    "upload_bytes"
+}
+
+
+# -------------------- HELPERS --------------------
+
+def mg23_require_admin(api_key):
+    global_admin_check(api_key)
+
+
+def mg23_parse_user_id(value):
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Invalid user ID")
+
+
+def mg23_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg23_user_quotas (
+            user_id BIGINT PRIMARY KEY,
+            daily_requests BIGINT NOT NULL DEFAULT 1000
+                CHECK (daily_requests >= 0),
+            monthly_requests BIGINT NOT NULL DEFAULT 30000
+                CHECK (monthly_requests >= 0),
+            storage_limit_bytes BIGINT NOT NULL DEFAULT 104857600
+                CHECK (storage_limit_bytes >= 0),
+            upload_limit_bytes BIGINT NOT NULL DEFAULT 10485760
+                CHECK (upload_limit_bytes >= 0),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg23_usage_events (
+            id UUID PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            resource VARCHAR(40) NOT NULL,
+            amount BIGINT NOT NULL CHECK (amount > 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS mg23_usage_user_resource_time_idx
+        ON mg23_usage_events (user_id, resource, created_at DESC)
+    """)
+
+
+def mg23_row(cursor, row):
+    if row is None:
+        return None
+    return dict(zip(
+        [column.name for column in cursor.description],
+        row
+    ))
+
+
+def mg23_usage_sum(cursor, user_id, resource, since):
+    cursor.execute("""
+        SELECT COALESCE(SUM(amount), 0)
+        FROM mg23_usage_events
+        WHERE user_id = %s
+          AND resource = %s
+          AND created_at >= %s
+    """, (user_id, resource, since))
+    return int(cursor.fetchone()[0])
+
+
+def mg23_get_or_create_quota(cursor, user_id):
+    cursor.execute("""
+        INSERT INTO mg23_user_quotas (user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+    """, (user_id,))
+
+    cursor.execute("""
+        SELECT user_id, daily_requests, monthly_requests,
+               storage_limit_bytes, upload_limit_bytes, updated_at
+        FROM mg23_user_quotas
+        WHERE user_id = %s
+    """, (user_id,))
+
+    return mg23_row(cursor, cursor.fetchone())
+
+
+# -------------------- MIGRATION --------------------
+
+@app.post("/api/v1/admin/migrations/quotas/apply")
+def mg23_apply_migration(
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg23_require_schema(cursor)
+
+    return {
+        "success": True,
+        "module": "global_quota_control",
+        "version": "23.0"
+    }
+
+
+# -------------------- CREATE / RESET USER QUOTA --------------------
+
+@app.post("/api/v1/admin/quotas")
+def mg23_create_quota(
+    data: MG23QuotaCreate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+    user_id = mg23_parse_user_id(data.user_id)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg23_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg23_user_quotas (
+                    user_id, daily_requests, monthly_requests,
+                    storage_limit_bytes, upload_limit_bytes, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    daily_requests = EXCLUDED.daily_requests,
+                    monthly_requests = EXCLUDED.monthly_requests,
+                    storage_limit_bytes = EXCLUDED.storage_limit_bytes,
+                    upload_limit_bytes = EXCLUDED.upload_limit_bytes,
+                    updated_at = NOW()
+                RETURNING user_id, daily_requests, monthly_requests,
+                          storage_limit_bytes, upload_limit_bytes, updated_at
+            """, (
+                user_id,
+                data.daily_requests,
+                data.monthly_requests,
+                data.storage_limit_bytes,
+                data.upload_limit_bytes
+            ))
+
+            result = mg23_row(cursor, cursor.fetchone())
+
+    return {"success": True, "quota": result}
+
+
+# -------------------- UPDATE USER QUOTA --------------------
+
+@app.patch("/api/v1/admin/quotas/{user_id}")
+def mg23_update_quota(
+    user_id: int,
+    data: MG23QuotaUpdate,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+
+    changes = data.dict(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="No update fields provided")
+
+    allowed = {
+        "daily_requests",
+        "monthly_requests",
+        "storage_limit_bytes",
+        "upload_limit_bytes"
+    }
+
+    if any(key not in allowed for key in changes):
+        raise HTTPException(status_code=422, detail="Invalid quota field")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg23_require_schema(cursor)
+
+            mg23_get_or_create_quota(cursor, user_id)
+
+            assignments = []
+            values = []
+
+            for key, value in changes.items():
+                assignments.append(key + " = %s")
+                values.append(value)
+
+            assignments.append("updated_at = NOW()")
+            values.append(user_id)
+
+            cursor.execute(
+                "UPDATE mg23_user_quotas SET "
+                + ", ".join(assignments)
+                + " WHERE user_id = %s "
+                + "RETURNING user_id, daily_requests, monthly_requests, "
+                + "storage_limit_bytes, upload_limit_bytes, updated_at",
+                tuple(values)
+            )
+
+            result = mg23_row(cursor, cursor.fetchone())
+
+    return {"success": True, "quota": result}
+
+
+# -------------------- RECORD USAGE --------------------
+
+@app.post("/api/v1/quotas/usage")
+def mg23_record_usage(
+    data: MG23UsageReport,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+
+    if data.resource not in MG23_RESOURCES:
+        raise HTTPException(status_code=422, detail="Invalid resource")
+
+    # This administrative endpoint is intentionally restricted.
+    # User-facing usage recording must be called internally by trusted
+    # server operations, never directly trusted from a client.
+
+    raise HTTPException(
+        status_code=501,
+        detail="Usage recording is reserved for trusted server integration"
+    )
+
+
+# -------------------- INTERNAL USAGE RECORDER --------------------
+
+def mg23_record_usage_internal(cursor, user_id, resource, amount):
+    if resource not in MG23_RESOURCES:
+        raise ValueError("Invalid quota resource")
+
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise ValueError("Usage amount must be a positive integer")
+
+    quota = mg23_get_or_create_quota(cursor, user_id)
+
+    now = datetime.now(timezone.utc)
+
+    if resource == "requests":
+        daily = mg23_usage_sum(
+            cursor, user_id, "requests",
+            now.replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+
+        month_start = now.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+
+        monthly = mg23_usage_sum(
+            cursor, user_id, "requests", month_start
+        )
+
+        if daily + amount > quota["daily_requests"]:
+            raise HTTPException(status_code=429, detail="Daily request quota exceeded")
+
+        if monthly + amount > quota["monthly_requests"]:
+            raise HTTPException(status_code=429, detail="Monthly request quota exceeded")
+
+    elif resource == "upload_bytes":
+        if amount > quota["upload_limit_bytes"]:
+            raise HTTPException(status_code=413, detail="Upload size limit exceeded")
+
+    elif resource == "storage_bytes":
+        current_storage = mg23_usage_sum(
+            cursor, user_id, "storage_bytes",
+            datetime(1970, 1, 1, tzinfo=timezone.utc)
+        )
+
+        if current_storage + amount > quota["storage_limit_bytes"]:
+            raise HTTPException(status_code=413, detail="Storage quota exceeded")
+
+    cursor.execute("""
+        INSERT INTO mg23_usage_events (
+            id, user_id, resource, amount
+        )
+        VALUES (%s, %s, %s, %s)
+    """, (mg23_uuid.uuid4(), user_id, resource, amount))
+
+
+# -------------------- USER QUOTA REPORT --------------------
+
+@app.get("/api/v1/admin/quotas/{user_id}")
+def mg23_get_quota(
+    user_id: int,
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg23_require_schema(cursor)
+
+            quota = mg23_get_or_create_quota(cursor, user_id)
+
+            now = datetime.now(timezone.utc)
+            day_start = now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            month_start = now.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            all_time = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+            daily_requests_used = mg23_usage_sum(
+                cursor, user_id, "requests", day_start
+            )
+
+            monthly_requests_used = mg23_usage_sum(
+                cursor, user_id, "requests", month_start
+            )
+
+            storage_used = mg23_usage_sum(
+                cursor, user_id, "storage_bytes", all_time
+            )
+
+            result = {
+                "user_id": user_id,
+                "limits": quota,
+                "usage": {
+                    "daily_requests": daily_requests_used,
+                    "monthly_requests": monthly_requests_used,
+                    "storage_bytes": storage_used
+                }
+            }
+
+    return {"success": True, "quota_report": result}
+
+
+# -------------------- ADMIN USAGE HISTORY --------------------
+
+@app.get("/api/v1/admin/quotas/{user_id}/history")
+def mg23_usage_history(
+    user_id: int,
+    resource: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    x_admin_api_key: Optional[str] = Header(default=None)
+):
+    mg23_require_admin(x_admin_api_key)
+
+    if resource is not None and resource not in MG23_RESOURCES:
+        raise HTTPException(status_code=422, detail="Invalid resource")
+
+    with get_db() as connection:
+        with connection.cursor() as cursor:
+            mg23_require_schema(cursor)
+
+            if resource is None:
+                cursor.execute("""
+                    SELECT id, resource, amount, created_at
+                    FROM mg23_usage_events
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user_id, limit, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, resource, amount, created_at
+                    FROM mg23_usage_events
+                    WHERE user_id = %s AND resource = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user_id, resource, limit, offset))
+
+            rows = [
+                mg23_row(cursor, row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+# ============================================================
+# END OF SECTION 23
+# ============================================================
