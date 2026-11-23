@@ -3785,3 +3785,517 @@ def global_admin_report_decision(
 # END OF SECTION 5
 # NEXT: SECTION 6 — SEARCH + DISCOVERY + GLOBAL DIRECTORY
 # =========================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 6 — GLOBAL DISCOVERY ENGINE
+# Search / Explore / Trending / Popular / New
+# ============================================================
+
+from fastapi import Query
+
+
+def discovery_post_dict(row):
+    return {
+        "id": str(row["id"]),
+        "user_id": str(row["user_id"]),
+        "content": row["content"],
+        "media_url": row.get("media_url"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "likes_count": int(row.get("likes_count") or 0),
+        "comments_count": int(row.get("comments_count") or 0),
+        "engagement_score": float(row.get("engagement_score") or 0),
+        "author": {
+            "display_name": row.get("display_name"),
+            "avatar_url": row.get("avatar_url"),
+        },
+    }
+
+
+def discovery_user_dict(row):
+    return {
+        "id": str(row["id"]),
+        "display_name": row.get("display_name"),
+        "bio": row.get("bio"),
+        "avatar_url": row.get("avatar_url"),
+        "cover_url": row.get("cover_url"),
+        "followers_count": int(row.get("followers_count") or 0),
+        "following_count": int(row.get("following_count") or 0),
+        "posts_count": int(row.get("posts_count") or 0),
+    }
+
+
+def discovery_pagination(limit, offset):
+    limit = max(1, min(int(limit), 50))
+    offset = max(0, int(offset))
+    return limit, offset
+
+
+def discovery_search_pattern(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+
+    # Escape SQL LIKE wildcards so user input is treated literally.
+    value = value.replace("\\", "\\\\")
+    value = value.replace("%", "\\%").replace("_", "\\_")
+    return "%" + value + "%"
+
+
+@app.get("/api/v1/discovery/search")
+def global_discovery_search(
+    q: str = Query(..., min_length=2, max_length=100),
+    search_type: str = Query("all", pattern="^(all|users|posts)$"),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None),
+):
+    user = global_user(authorization)
+    require_global_schema()
+
+    limit, offset = discovery_pagination(limit, offset)
+    pattern = discovery_search_pattern(q)
+
+    if not pattern:
+        raise HTTPException(status_code=400, detail="عبارت جست‌وجو معتبر نیست")
+
+    result = {"query": q.strip(), "users": [], "posts": []}
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+
+            if search_type in ("all", "users"):
+                cursor.execute(
+                    """
+                    SELECT
+                        u.id,
+                        p.display_name,
+                        p.bio,
+                        p.avatar_url,
+                        p.cover_url,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_follows f
+                            WHERE f.following_id = u.id
+                        ) AS followers_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_follows f
+                            WHERE f.follower_id = u.id
+                        ) AS following_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_posts sp
+                            WHERE sp.user_id = u.id
+                              AND sp.deleted_at IS NULL
+                        ) AS posts_count
+                    FROM mg_users u
+                    JOIN mg_user_profiles p ON p.user_id = u.id
+                    WHERE u.id <> %s
+                      AND p.profile_visibility = 'public'
+                      AND (
+                          p.display_name ILIKE %s ESCAPE '\\'
+                          OR COALESCE(p.bio, '') ILIKE %s ESCAPE '\\'
+                      )
+                    ORDER BY followers_count DESC, p.display_name ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (user["id"], pattern, pattern, limit, offset),
+                )
+
+                result["users"] = [
+                    discovery_user_dict(row)
+                    for row in cursor.fetchall()
+                ]
+
+            if search_type in ("all", "posts"):
+                cursor.execute(
+                    """
+                    SELECT
+                        sp.id,
+                        sp.user_id,
+                        sp.content,
+                        sp.media_url,
+                        sp.created_at,
+                        p.display_name,
+                        p.avatar_url,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_likes sl
+                            WHERE sl.post_id = sp.id
+                        ) AS likes_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_comments sc
+                            WHERE sc.post_id = sp.id
+                        ) AS comments_count,
+                        (
+                            SELECT COUNT(*) * 2
+                            FROM mg_social_likes sl
+                            WHERE sl.post_id = sp.id
+                        ) +
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_comments sc
+                            WHERE sc.post_id = sp.id
+                        ) AS engagement_score
+                    FROM mg_social_posts sp
+                    JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    WHERE sp.visibility = 'public'
+                      AND sp.deleted_at IS NULL
+                      AND p.profile_visibility = 'public'
+                      AND sp.content ILIKE %s ESCAPE '\\'
+                    ORDER BY sp.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (pattern, limit, offset),
+                )
+
+                result["posts"] = [
+                    discovery_post_dict(row)
+                    for row in cursor.fetchall()
+                ]
+
+    return {
+        "success": True,
+        "data": result,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
+@app.get("/api/v1/discovery/trending")
+def global_discovery_trending(
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None),
+):
+    user = global_user(authorization)
+    require_global_schema()
+
+    limit, offset = discovery_pagination(limit, offset)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    sp.id,
+                    sp.user_id,
+                    sp.content,
+                    sp.media_url,
+                    sp.created_at,
+                    p.display_name,
+                    p.avatar_url,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_likes sl
+                        WHERE sl.post_id = sp.id
+                    ) AS likes_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_comments sc
+                        WHERE sc.post_id = sp.id
+                    ) AS comments_count,
+                    (
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_likes sl
+                            WHERE sl.post_id = sp.id
+                        ) * 2
+                        +
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_comments sc
+                            WHERE sc.post_id = sp.id
+                        ) * 3
+                    )::DOUBLE PRECISION
+                    /
+                    GREATEST(
+                        1,
+                        EXTRACT(EPOCH FROM (NOW() - sp.created_at)) / 3600 + 2
+                    ) AS engagement_score
+                FROM mg_social_posts sp
+                JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                WHERE sp.visibility = 'public'
+                  AND sp.deleted_at IS NULL
+                  AND p.profile_visibility = 'public'
+                  AND sp.created_at >= NOW() - INTERVAL '30 days'
+                ORDER BY engagement_score DESC, sp.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+
+            posts = [
+                discovery_post_dict(row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "data": posts,
+        "algorithm": "engagement_recency_v1",
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
+@app.get("/api/v1/discovery/latest")
+def global_discovery_latest(
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None),
+):
+    user = global_user(authorization)
+    require_global_schema()
+
+    limit, offset = discovery_pagination(limit, offset)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    sp.id,
+                    sp.user_id,
+                    sp.content,
+                    sp.media_url,
+                    sp.created_at,
+                    p.display_name,
+                    p.avatar_url,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_likes sl
+                        WHERE sl.post_id = sp.id
+                    ) AS likes_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_comments sc
+                        WHERE sc.post_id = sp.id
+                    ) AS comments_count,
+                    0::DOUBLE PRECISION AS engagement_score
+                FROM mg_social_posts sp
+                JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                WHERE sp.visibility = 'public'
+                  AND sp.deleted_at IS NULL
+                  AND p.profile_visibility = 'public'
+                ORDER BY sp.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+
+            posts = [
+                discovery_post_dict(row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "data": posts,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
+@app.get("/api/v1/discovery/creators")
+def global_discovery_creators(
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None),
+):
+    user = global_user(authorization)
+    require_global_schema()
+
+    limit, offset = discovery_pagination(limit, offset)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    u.id,
+                    p.display_name,
+                    p.bio,
+                    p.avatar_url,
+                    p.cover_url,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_follows f
+                        WHERE f.following_id = u.id
+                    ) AS followers_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_follows f
+                        WHERE f.follower_id = u.id
+                    ) AS following_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM mg_social_posts sp
+                        WHERE sp.user_id = u.id
+                          AND sp.deleted_at IS NULL
+                    ) AS posts_count
+                FROM mg_users u
+                JOIN mg_user_profiles p ON p.user_id = u.id
+                WHERE p.profile_visibility = 'public'
+                ORDER BY followers_count DESC, posts_count DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+
+            creators = [
+                discovery_user_dict(row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "data": creators,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
+@app.get("/api/v1/discovery/popular")
+def global_discovery_popular(
+    period: str = Query("7d", pattern="^(24h|7d|30d|all)$"),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None),
+):
+    user = global_user(authorization)
+    require_global_schema()
+
+    limit, offset = discovery_pagination(limit, offset)
+
+    intervals = {
+        "24h": "24 hours",
+        "7d": "7 days",
+        "30d": "30 days",
+        "all": None,
+    }
+
+    interval = intervals[period]
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            if interval:
+                cursor.execute(
+                    """
+                    SELECT
+                        sp.id,
+                        sp.user_id,
+                        sp.content,
+                        sp.media_url,
+                        sp.created_at,
+                        p.display_name,
+                        p.avatar_url,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_likes sl
+                            WHERE sl.post_id = sp.id
+                        ) AS likes_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_comments sc
+                            WHERE sc.post_id = sp.id
+                        ) AS comments_count,
+                        (
+                            (
+                                SELECT COUNT(*)
+                                FROM mg_social_likes sl
+                                WHERE sl.post_id = sp.id
+                            ) * 2
+                            +
+                            (
+                                SELECT COUNT(*)
+                                FROM mg_social_comments sc
+                                WHERE sc.post_id = sp.id
+                            ) * 3
+                        )::DOUBLE PRECISION AS engagement_score
+                    FROM mg_social_posts sp
+                    JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    WHERE sp.visibility = 'public'
+                      AND sp.deleted_at IS NULL
+                      AND p.profile_visibility = 'public'
+                      AND sp.created_at >= NOW() - %s::INTERVAL
+                    ORDER BY engagement_score DESC, sp.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (interval, limit, offset),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        sp.id,
+                        sp.user_id,
+                        sp.content,
+                        sp.media_url,
+                        sp.created_at,
+                        p.display_name,
+                        p.avatar_url,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_likes sl
+                            WHERE sl.post_id = sp.id
+                        ) AS likes_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM mg_social_comments sc
+                            WHERE sc.post_id = sp.id
+                        ) AS comments_count,
+                        (
+                            (
+                                SELECT COUNT(*)
+                                FROM mg_social_likes sl
+                                WHERE sl.post_id = sp.id
+                            ) * 2
+                            +
+                            (
+                                SELECT COUNT(*)
+                                FROM mg_social_comments sc
+                                WHERE sc.post_id = sp.id
+                            ) * 3
+                        )::DOUBLE PRECISION AS engagement_score
+                    FROM mg_social_posts sp
+                    JOIN mg_user_profiles p ON p.user_id = sp.user_id
+                    WHERE sp.visibility = 'public'
+                      AND sp.deleted_at IS NULL
+                      AND p.profile_visibility = 'public'
+                    ORDER BY engagement_score DESC, sp.created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (limit, offset),
+                )
+
+            posts = [
+                discovery_post_dict(row)
+                for row in cursor.fetchall()
+            ]
+
+    return {
+        "success": True,
+        "period": period,
+        "data": posts,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
+# ============================================================
+# END SECTION 6
+# NEXT: GLOBAL PRIVACY / BLOCKING / ACCOUNT SAFETY ENGINE
+# ============================================================
