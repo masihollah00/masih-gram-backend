@@ -9583,3 +9583,463 @@ def export_delete(
 
 
 # END OF SECTION 16
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 17
+# ADVANCED API KEY & ACCESS CONTROL ENGINE
+# ============================================================
+
+import secrets as mg17_secrets
+import hashlib as mg17_hashlib
+import uuid as mg17_uuid
+import re as mg17_re
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+MG17_VERSION = "17.0.0"
+MG17_PREFIX = "mgk_"
+MG17_MAX_DAILY_LIMIT = 100000
+MG17_MAX_ACTIVE_KEYS = 20
+
+
+class MG17CreateKey(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    daily_limit: int = Field(default=1000, ge=1, le=100000)
+    expires_in_days: int = Field(default=30, ge=1, le=365)
+
+
+class MG17KeyStatus(BaseModel):
+    active: bool
+
+
+def mg17_hash(value: str) -> str:
+    return mg17_hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+def mg17_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+
+    return str(value)
+
+
+def mg17_require_user(authorization):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required"
+        )
+
+    # Uses the existing authentication verifier without
+    # depending on any social or feature-engine tables.
+    user = global_user(authorization)
+    return mg17_user_id(user)
+
+
+def mg17_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg17_access_keys (
+            id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name VARCHAR(80) NOT NULL,
+            key_hash CHAR(64) NOT NULL UNIQUE,
+            key_prefix VARCHAR(16) NOT NULL,
+            daily_limit INTEGER NOT NULL DEFAULT 1000,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        mg17_access_keys_user_idx
+        ON mg17_access_keys(user_id, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg17_access_usage (
+            id BIGSERIAL PRIMARY KEY,
+            key_id UUID NOT NULL
+                REFERENCES mg17_access_keys(id)
+                ON DELETE CASCADE,
+            used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        mg17_access_usage_key_date_idx
+        ON mg17_access_usage(key_id, used_at DESC)
+    """)
+
+
+def mg17_validate_key_name(name):
+    if not isinstance(name, str):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid key name"
+        )
+
+    name = name.strip()
+
+    if not 2 <= len(name) <= 80:
+        raise HTTPException(
+            status_code=422,
+            detail="Key name must contain 2 to 80 characters"
+        )
+
+    return name
+
+
+@app.post("/api/v1/access-keys")
+def mg17_create_key(
+    data: MG17CreateKey,
+    authorization: Optional[str] = Header(default=None)
+):
+    user_id = mg17_require_user(authorization)
+    name = mg17_validate_key_name(data.name)
+
+    raw_key = MG17_PREFIX + mg17_secrets.token_urlsafe(40)
+    key_hash = mg17_hash(raw_key)
+    key_prefix = raw_key[:12]
+
+    expires_at = (
+        datetime.now(timezone.utc)
+        + timedelta(days=data.expires_in_days)
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM mg17_access_keys
+                WHERE user_id = %s
+                  AND active = TRUE
+                  AND expires_at > NOW()
+            """, (user_id,))
+
+            active_count = cursor.fetchone()[0]
+
+            if active_count >= MG17_MAX_ACTIVE_KEYS:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Maximum active key limit reached"
+                )
+
+            cursor.execute("""
+                INSERT INTO mg17_access_keys (
+                    id, user_id, name, key_hash,
+                    key_prefix, daily_limit, expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, created_at
+            """, (
+                str(mg17_uuid.uuid4()),
+                user_id,
+                name,
+                key_hash,
+                key_prefix,
+                data.daily_limit,
+                expires_at
+            ))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "id": str(row[0]),
+        "name": name,
+        "api_key": raw_key,
+        "prefix": key_prefix,
+        "daily_limit": data.daily_limit,
+        "expires_at": expires_at.isoformat(),
+        "created_at": row[1].isoformat(),
+        "warning": "The complete API key is shown only once."
+    }
+
+
+@app.get("/api/v1/access-keys")
+def mg17_list_keys(
+    authorization: Optional[str] = Header(default=None)
+):
+    user_id = mg17_require_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    id, name, key_prefix, daily_limit,
+                    active, expires_at, created_at,
+                    last_used_at, revoked_at
+                FROM mg17_access_keys
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+            """, (user_id,))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "items": [
+            {
+                "id": str(row[0]),
+                "name": row[1],
+                "prefix": row[2],
+                "daily_limit": row[3],
+                "active": row[4],
+                "expired": row[5] <= datetime.now(timezone.utc),
+                "expires_at": row[5].isoformat(),
+                "created_at": row[6].isoformat(),
+                "last_used_at": (
+                    row[7].isoformat() if row[7] else None
+                ),
+                "revoked_at": (
+                    row[8].isoformat() if row[8] else None
+                )
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/v1/access-keys/{key_id}/revoke")
+def mg17_revoke_key(
+    key_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user_id = mg17_require_user(authorization)
+
+    try:
+        key_id = str(mg17_uuid.UUID(key_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid key ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg17_access_keys
+                SET active = FALSE,
+                    revoked_at = NOW()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND active = TRUE
+                RETURNING id
+            """, (key_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Active key not found"
+        )
+
+    return {
+        "success": True,
+        "revoked": True,
+        "key_id": str(row[0])
+    }
+
+
+@app.delete("/api/v1/access-keys/{key_id}")
+def mg17_delete_key(
+    key_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user_id = mg17_require_user(authorization)
+
+    try:
+        key_id = str(mg17_uuid.UUID(key_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid key ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM mg17_access_keys
+                WHERE id = %s AND user_id = %s
+                RETURNING id
+            """, (key_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found"
+        )
+
+    return {
+        "success": True,
+        "deleted": True
+    }
+
+
+@app.get("/api/v1/access-keys/{key_id}/statistics")
+def mg17_key_statistics(
+    key_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user_id = mg17_require_user(authorization)
+
+    try:
+        key_id = str(mg17_uuid.UUID(key_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid key ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    k.id,
+                    k.name,
+                    k.daily_limit,
+                    k.active,
+                    k.expires_at,
+                    COUNT(u.id) FILTER (
+                        WHERE u.used_at >= NOW() - INTERVAL '24 hours'
+                    ),
+                    COUNT(u.id)
+                FROM mg17_access_keys k
+                LEFT JOIN mg17_access_usage u
+                    ON u.key_id = k.id
+                WHERE k.id = %s
+                  AND k.user_id = %s
+                GROUP BY k.id
+            """, (key_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found"
+        )
+
+    return {
+        "success": True,
+        "key_id": str(row[0]),
+        "name": row[1],
+        "daily_limit": row[2],
+        "active": row[3],
+        "expires_at": row[4].isoformat(),
+        "requests_last_24_hours": row[5],
+        "requests_total": row[6],
+        "remaining_daily": max(0, row[2] - row[5])
+    }
+
+
+@app.post("/api/v1/access-keys/verify")
+def mg17_verify_key(
+    x_api_key: str = Header(..., alias="X-API-Key")
+):
+    if not isinstance(x_api_key, str):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    if not x_api_key.startswith(MG17_PREFIX):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    key_hash = mg17_hash(x_api_key)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            mg17_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, user_id, daily_limit, expires_at
+                FROM mg17_access_keys
+                WHERE key_hash = %s
+                  AND active = TRUE
+                  AND expires_at > NOW()
+                FOR UPDATE
+            """, (key_hash,))
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or expired API key"
+                )
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM mg17_access_usage
+                WHERE key_id = %s
+                  AND used_at >= NOW() - INTERVAL '24 hours'
+            """, (str(row[0]),))
+
+            used = cursor.fetchone()[0]
+
+            if used >= row[2]:
+                raise HTTPException(
+                    status_code=429,
+                    detail="API key daily limit reached"
+                )
+
+            cursor.execute("""
+                INSERT INTO mg17_access_usage (key_id)
+                VALUES (%s)
+            """, (str(row[0]),))
+
+            cursor.execute("""
+                UPDATE mg17_access_keys
+                SET last_used_at = NOW()
+                WHERE id = %s
+            """, (str(row[0]),))
+
+    return {
+        "success": True,
+        "valid": True,
+        "owner_id": row[1],
+        "expires_at": row[3].isoformat()
+    }
+
+
+# END OF SECTION 17
