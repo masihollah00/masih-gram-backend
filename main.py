@@ -6099,3 +6099,616 @@ def admin_messaging_reports(
 # END SECTION 8
 # NEXT: GLOBAL RELIABLE EVENT & NOTIFICATION DELIVERY ENGINE
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 9 — RELIABLE EVENT DELIVERY ENGINE
+# Persistent Outbox / Retry / Idempotency / Worker Leases
+# ============================================================
+
+import re as event_re
+import uuid as event_uuid
+
+
+EVENT_ENGINE_VERSION = "1.0.0"
+
+EVENT_MAX_BATCH = 100
+EVENT_MAX_ATTEMPTS = 12
+EVENT_DEFAULT_LEASE_SECONDS = 90
+EVENT_MAX_LEASE_SECONDS = 600
+EVENT_MAX_RETRY_SECONDS = 86400
+
+
+# ------------------------------------------------------------
+# REQUEST MODELS
+# ------------------------------------------------------------
+
+class EventAcknowledgeRequest(BaseModel):
+    lease_token: str = Field(..., min_length=36, max_length=36)
+
+
+class EventRetryRequest(BaseModel):
+    lease_token: str = Field(..., min_length=36, max_length=36)
+    error: str = Field(..., min_length=1, max_length=2000)
+    retry_after_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=EVENT_MAX_RETRY_SECONDS
+    )
+
+
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
+
+def event_require_admin(x_admin_key):
+    configured_key = os.getenv("ADMIN_API_KEY")
+
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="کلید مدیریت سرور تنظیم نشده است"
+        )
+
+    if not x_admin_key or not hmac.compare_digest(
+        str(x_admin_key),
+        str(configured_key)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="دسترسی سرویس مجاز نیست"
+        )
+
+
+def event_validate_type(value):
+    value = str(value or "").strip().lower()
+
+    if not event_re.fullmatch(r"[a-z0-9_.-]{2,100}", value):
+        raise HTTPException(
+            status_code=400,
+            detail="نوع رویداد معتبر نیست"
+        )
+
+    return value
+
+
+def event_validate_payload(payload):
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="محتوای رویداد باید یک شیء JSON باشد"
+        )
+
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="محتوای رویداد قابل تبدیل به JSON نیست"
+        )
+
+    if len(encoded.encode("utf-8")) > 65536:
+        raise HTTPException(
+            status_code=413,
+            detail="حجم محتوای رویداد بیش از حد مجاز است"
+        )
+
+    return encoded
+
+
+def event_require_schema(cursor):
+    cursor.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = 'mg_event_outbox'
+    """)
+
+    if not cursor.fetchone():
+        raise HTTPException(
+            status_code=503,
+            detail="مهاجرت موتور رویداد اجرا نشده است"
+        )
+
+
+# ------------------------------------------------------------
+# DATABASE MIGRATION
+# ------------------------------------------------------------
+
+@app.post("/api/v1/admin/migrations/events/apply")
+def apply_event_engine_migration(
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    event_require_admin(x_admin_key)
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS mg_event_outbox (
+            id BIGSERIAL PRIMARY KEY,
+            event_id UUID NOT NULL UNIQUE,
+            event_type VARCHAR(100) NOT NULL,
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            idempotency_key VARCHAR(180),
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 12,
+            available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            lease_token UUID,
+            lease_until TIMESTAMPTZ,
+            delivered_at TIMESTAMPTZ,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                status IN (
+                    'pending',
+                    'processing',
+                    'delivered',
+                    'dead'
+                )
+            ),
+            CHECK (attempts >= 0),
+            CHECK (max_attempts BETWEEN 1 AND 100)
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_event_outbox_idempotency
+        ON mg_event_outbox(idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_event_outbox_pending
+        ON mg_event_outbox(available_at, created_at)
+        WHERE status = 'pending'
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_event_outbox_processing
+        ON mg_event_outbox(lease_until)
+        WHERE status = 'processing'
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_event_outbox_delivered
+        ON mg_event_outbox(delivered_at DESC)
+        WHERE status = 'delivered'
+        """,
+    ]
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+
+    return {
+        "success": True,
+        "migration": "reliable_event_delivery",
+        "version": EVENT_ENGINE_VERSION
+    }
+
+
+# ------------------------------------------------------------
+# INTERNAL EVENT CREATION
+#
+# Call inside the same database transaction as the business
+# operation that creates the event.
+#
+# Example:
+# global_enqueue_event(
+#     cursor,
+#     "message.created",
+#     {"message_id": str(message_id)},
+#     "message-created-" + str(message_id)
+# )
+# ------------------------------------------------------------
+
+def global_enqueue_event(
+    cursor,
+    event_type,
+    payload,
+    idempotency_key=None,
+    max_attempts=EVENT_MAX_ATTEMPTS,
+    available_seconds=0
+):
+    event_type = event_validate_type(event_type)
+    encoded_payload = event_validate_payload(payload)
+
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
+
+        if not idempotency_key or len(idempotency_key) > 180:
+            raise HTTPException(
+                status_code=400,
+                detail="کلید یکتایی رویداد معتبر نیست"
+            )
+
+    if not 1 <= int(max_attempts) <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="تعداد تلاش نامعتبر است"
+        )
+
+    if not 0 <= int(available_seconds) <= EVENT_MAX_RETRY_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail="زمان اجرای رویداد معتبر نیست"
+        )
+
+    new_event_id = event_uuid.uuid4()
+
+    cursor.execute(
+        """
+        INSERT INTO mg_event_outbox (
+            event_id,
+            event_type,
+            payload,
+            idempotency_key,
+            max_attempts,
+            available_at
+        )
+        VALUES (
+            %s,
+            %s,
+            %s::jsonb,
+            %s,
+            %s,
+            NOW() + (%s * INTERVAL '1 second')
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING id, event_id, status
+        """,
+        (
+            new_event_id,
+            event_type,
+            encoded_payload,
+            idempotency_key,
+            int(max_attempts),
+            int(available_seconds)
+        )
+    )
+
+    row = cursor.fetchone()
+
+    if row:
+        return {
+            "created": True,
+            "id": row["id"],
+            "event_id": str(row["event_id"]),
+            "status": row["status"]
+        }
+
+    if idempotency_key is not None:
+        cursor.execute(
+            """
+            SELECT id, event_id, status
+            FROM mg_event_outbox
+            WHERE idempotency_key = %s
+            """,
+            (idempotency_key,)
+        )
+
+        existing = cursor.fetchone()
+
+        if existing:
+            return {
+                "created": False,
+                "id": existing["id"],
+                "event_id": str(existing["event_id"]),
+                "status": existing["status"]
+            }
+
+    raise HTTPException(
+        status_code=409,
+        detail="رویداد ثبت نشد؛ درخواست را دوباره بررسی کنید"
+    )
+
+
+# ------------------------------------------------------------
+# WORKER: CLAIM EVENTS
+#
+# Workers must process returned events and acknowledge or
+# retry them using their lease token.
+# ------------------------------------------------------------
+
+@app.post("/api/v1/internal/events/claim")
+def claim_outbox_events(
+    batch_size: int = Query(20, ge=1, le=EVENT_MAX_BATCH),
+    lease_seconds: int = Query(
+        EVENT_DEFAULT_LEASE_SECONDS,
+        ge=10,
+        le=EVENT_MAX_LEASE_SECONDS
+    ),
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    event_require_admin(x_admin_key)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            event_require_schema(cursor)
+
+            cursor.execute(
+                """
+                WITH candidates AS (
+                    SELECT id
+                    FROM mg_event_outbox
+                    WHERE (
+                        status = 'pending'
+                        AND available_at <= NOW()
+                    )
+                    OR (
+                        status = 'processing'
+                        AND lease_until < NOW()
+                    )
+                    ORDER BY available_at ASC, created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE mg_event_outbox AS events
+                SET
+                    status = CASE
+                        WHEN events.attempts + 1 >= events.max_attempts
+                            THEN 'dead'
+                        ELSE 'processing'
+                    END,
+                    attempts = events.attempts + 1,
+                    lease_token = CASE
+                        WHEN events.attempts + 1 >= events.max_attempts
+                            THEN NULL
+                        ELSE gen_random_uuid()
+                    END,
+                    lease_until = CASE
+                        WHEN events.attempts + 1 >= events.max_attempts
+                            THEN NULL
+                        ELSE NOW() + (%s * INTERVAL '1 second')
+                    END,
+                    updated_at = NOW()
+                FROM candidates
+                WHERE events.id = candidates.id
+                RETURNING
+                    events.id,
+                    events.event_id,
+                    events.event_type,
+                    events.payload,
+                    events.attempts,
+                    events.max_attempts,
+                    events.status,
+                    events.lease_token,
+                    events.lease_until
+                """,
+                (batch_size, lease_seconds)
+            )
+
+            rows = cursor.fetchall()
+
+    claimed = []
+
+    for row in rows:
+        if row["status"] != "processing":
+            continue
+
+        claimed.append({
+            "id": row["id"],
+            "event_id": str(row["event_id"]),
+            "event_type": row["event_type"],
+            "payload": row["payload"],
+            "attempt": row["attempts"],
+            "max_attempts": row["max_attempts"],
+            "lease_token": str(row["lease_token"]),
+            "lease_until": row["lease_until"].isoformat()
+        })
+
+    return {
+        "success": True,
+        "count": len(claimed),
+        "events": claimed
+    }
+
+
+# ------------------------------------------------------------
+# WORKER: ACKNOWLEDGE SUCCESS
+# ------------------------------------------------------------
+
+@app.post("/api/v1/internal/events/{event_row_id}/ack")
+def acknowledge_outbox_event(
+    event_row_id: int,
+    payload: EventAcknowledgeRequest,
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    event_require_admin(x_admin_key)
+
+    try:
+        lease_token = event_uuid.UUID(payload.lease_token)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="شناسه قفل رویداد معتبر نیست"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            event_require_schema(cursor)
+
+            cursor.execute(
+                """
+                UPDATE mg_event_outbox
+                SET
+                    status = 'delivered',
+                    delivered_at = NOW(),
+                    lease_token = NULL,
+                    lease_until = NULL,
+                    last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'processing'
+                  AND lease_token = %s
+                  AND lease_until > NOW()
+                RETURNING id, event_id
+                """,
+                (event_row_id, lease_token)
+            )
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=409,
+            detail="قفل رویداد منقضی شده یا متعلق به این پردازش نیست"
+        )
+
+    return {
+        "success": True,
+        "status": "delivered",
+        "event_id": str(row["event_id"])
+    }
+
+
+# ------------------------------------------------------------
+# WORKER: RETRY AFTER FAILURE
+# ------------------------------------------------------------
+
+@app.post("/api/v1/internal/events/{event_row_id}/retry")
+def retry_outbox_event(
+    event_row_id: int,
+    payload: EventRetryRequest,
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    event_require_admin(x_admin_key)
+
+    try:
+        lease_token = event_uuid.UUID(payload.lease_token)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="شناسه قفل رویداد معتبر نیست"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            event_require_schema(cursor)
+
+            cursor.execute(
+                """
+                UPDATE mg_event_outbox
+                SET
+                    status = CASE
+                        WHEN attempts >= max_attempts
+                            THEN 'dead'
+                        ELSE 'pending'
+                    END,
+                    available_at = NOW() + (
+                        %s * INTERVAL '1 second'
+                    ),
+                    lease_token = NULL,
+                    lease_until = NULL,
+                    last_error = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'processing'
+                  AND lease_token = %s
+                  AND lease_until > NOW()
+                RETURNING id, event_id, status, attempts
+                """,
+                (
+                    payload.retry_after_seconds,
+                    payload.error,
+                    event_row_id,
+                    lease_token
+                )
+            )
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=409,
+            detail="قفل رویداد منقضی شده یا متعلق به این پردازش نیست"
+        )
+
+    return {
+        "success": True,
+        "event_id": str(row["event_id"]),
+        "status": row["status"],
+        "attempts": row["attempts"]
+    }
+
+
+# ------------------------------------------------------------
+# ADMIN: EVENT QUEUE STATISTICS
+# ------------------------------------------------------------
+
+@app.get("/api/v1/admin/events/statistics")
+def get_event_queue_statistics(
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    event_require_admin(x_admin_key)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            event_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE status = 'pending'
+                    ) AS pending,
+                    COUNT(*) FILTER (
+                        WHERE status = 'processing'
+                          AND lease_until > NOW()
+                    ) AS processing,
+                    COUNT(*) FILTER (
+                        WHERE status = 'processing'
+                          AND lease_until <= NOW()
+                    ) AS expired_leases,
+                    COUNT(*) FILTER (
+                        WHERE status = 'delivered'
+                    ) AS delivered,
+                    COUNT(*) FILTER (
+                        WHERE status = 'dead'
+                    ) AS dead
+                FROM mg_event_outbox
+                """
+            )
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "statistics": {
+            "total": row["total"],
+            "pending": row["pending"],
+            "processing": row["processing"],
+            "expired_leases": row["expired_leases"],
+            "delivered": row["delivered"],
+            "dead": row["dead"]
+        }
+    }
+
+
+# ============================================================
+# END SECTION 9
+# NEXT: MEDIA STORAGE & SECURE UPLOAD ENGINE
+# ============================================================
