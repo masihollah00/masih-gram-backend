@@ -7,6 +7,7 @@ import time
 import base64
 import hashlib
 import secrets
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -41,6 +42,10 @@ app = FastAPI(
     description="ULTRA PREMIUM · GLOBAL EDITION",
     version=APP_VERSION
 )
+
+logger = logging.getLogger("masih_gram")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
 # ---------------------------------------------------------
@@ -129,7 +134,20 @@ def _secret_bytes(name: str) -> bytes:
 
 
 def auth_secret() -> bytes:
-    return _secret_bytes("AUTH_SECRET")
+    """Load the signing secret, accepting the legacy Render variable name."""
+    value = (os.getenv("AUTH_SECRET") or os.getenv("JWT_SECRET") or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=503,
+            detail="Server configuration missing: AUTH_SECRET (or legacy JWT_SECRET)"
+        )
+    raw = value.encode("utf-8")
+    if len(raw) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="AUTH_SECRET/JWT_SECRET must contain at least 32 bytes"
+        )
+    return raw
 
 
 def otp_pepper() -> bytes:
@@ -773,9 +791,14 @@ def verify_otp(data: OTPVerify, request: Request):
                 detail="Username must contain 3-32 letters, numbers or underscores"
             )
 
+    # Validate token signing configuration before opening the transaction.
+    # Otherwise a valid OTP could be consumed and the DB session committed,
+    # then token creation could fail because AUTH_SECRET/JWT_SECRET is absent.
+    auth_secret()
     code_hash = hash_otp(phone, data.purpose, data.code)
     wrong_code = False
     result = None
+    access_token = None
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -848,6 +871,7 @@ def verify_otp(data: OTPVerify, request: Request):
                             phone_verified_at, registration_completed_at
                         )
                         VALUES (%s, %s, %s, NULL, 'active', TRUE, NOW(), NOW())
+                        ON CONFLICT DO NOTHING
                         RETURNING id, username, display_name, account_status
                     """, (
                         data.username.lower(),
@@ -855,6 +879,11 @@ def verify_otp(data: OTPVerify, request: Request):
                         phone
                     ))
                     user = cursor.fetchone()
+                    if not user:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Username or phone number is already registered"
+                        )
 
                     cursor.execute("""
                         INSERT INTO public.mg_user_profiles(user_id)
@@ -923,6 +952,7 @@ def verify_otp(data: OTPVerify, request: Request):
                     WHERE id = %s
                 """, (user_id,))
 
+                access_token = create_access_token(user_id, session_id)
                 result = {
                     "user_id": user_id,
                     "username": user[1],
@@ -939,10 +969,8 @@ def verify_otp(data: OTPVerify, request: Request):
             detail="Verification code is incorrect"
         )
 
-    access_token = create_access_token(
-        result["user_id"],
-        result["session_id"]
-    )
+    if not result or not access_token:
+        raise HTTPException(status_code=500, detail="Authentication could not be completed")
 
     return {
         "success": True,
@@ -14067,3 +14095,21 @@ def mg3_messenger_status(authorization: Optional[str]=Header(None)):
     return {"success":True,"version":"3.0.0","modules":{"direct_messages":"implemented","conversations":"implemented","message_edit_delete":"implemented","reactions":"implemented","read_receipts":"implemented","message_search":"implemented","groups":"implemented","channels":"implemented","community_members":"implemented","attachments_binary_transfer":"not_implemented","websocket_realtime":"not_implemented","voice_video_calls":"not_implemented","e2ee":"not_implemented"}}
 
 # END MASIH GRAM MESSENGER CORE 3.0
+
+
+# ---------------------------------------------------------
+# SAFE UNHANDLED ERROR REPORTING
+# ---------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    error_id = uuid.uuid4().hex[:12]
+    logger.exception(
+        "Unhandled request failure error_id=%s method=%s path=%s",
+        error_id, request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error_id": error_id},
+        headers={"X-Error-ID": error_id}
+    )
