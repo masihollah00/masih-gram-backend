@@ -1384,3 +1384,565 @@ def create_global_notification(
 # END MODULE 01
 # NEXT: GLOBAL MIGRATION + SOCIAL API
 # =========================================================
+
+# =========================================================
+# MODULE 02: GLOBAL MIGRATION + SOCIAL ENGINE
+# =========================================================
+
+@app.post("/api/v1/admin/migrations/global/apply")
+def apply_global_migration(
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    verify_admin_key(x_admin_key)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("masih_gram_003_global",)
+            )
+
+            for statement in GLOBAL_SCHEMA_STATEMENTS:
+                cursor.execute(statement, prepare=False)
+
+            cursor.execute("""
+                INSERT INTO public.mg_schema_migrations(version)
+                VALUES (%s)
+                ON CONFLICT(version) DO NOTHING
+            """, (GLOBAL_SCHEMA_VERSION,))
+
+            require_global_schema(cursor)
+
+    return {
+        "success": True,
+        "migration": GLOBAL_SCHEMA_VERSION,
+        "status": "applied"
+    }
+
+
+# ---------------------------------------------------------
+# SOCIAL SERIALIZATION
+# ---------------------------------------------------------
+
+def social_post_dict(row, liked=False):
+    return {
+        "id": str(row[0]),
+        "user": {
+            "id": str(row[1]),
+            "username": row[2],
+            "display_name": row[3]
+        },
+        "content": row[4],
+        "media_url": row[5],
+        "visibility": row[6],
+        "likes_count": row[7],
+        "comments_count": row[8],
+        "views_count": row[9],
+        "created_at": row[10].isoformat(),
+        "liked_by_me": liked
+    }
+
+
+SOCIAL_POST_SELECT = """
+    SELECT
+        p.id,
+        u.id,
+        u.username,
+        u.display_name,
+        p.content,
+        p.media_url,
+        p.visibility,
+        p.likes_count,
+        p.comments_count,
+        p.views_count,
+        p.created_at
+    FROM public.mg_social_posts p
+    JOIN public.mg_users u ON u.id = p.user_id
+"""
+
+
+# ---------------------------------------------------------
+# CREATE POST
+# ---------------------------------------------------------
+
+@app.post("/api/v1/social/posts")
+def create_social_post(
+    data: GlobalPostCreate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    if data.visibility not in ("public", "followers", "private"):
+        raise HTTPException(status_code=422, detail="Invalid visibility")
+
+    if data.media_url and not data.media_url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=422, detail="Invalid media URL")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO public.mg_social_posts (
+                    user_id, content, media_url, visibility
+                )
+                VALUES (%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                user["id"],
+                data.content.strip(),
+                data.media_url,
+                data.visibility
+            ))
+
+            post_id = cursor.fetchone()[0]
+
+            global_audit(
+                cursor,
+                user["id"],
+                "social.post.create",
+                "post",
+                post_id
+            )
+
+    return {
+        "success": True,
+        "post_id": str(post_id)
+    }
+
+
+# ---------------------------------------------------------
+# SOCIAL FEED
+# ---------------------------------------------------------
+
+@app.get("/api/v1/social/posts")
+def social_feed(
+    limit: int = 20,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute(
+                SOCIAL_POST_SELECT + """
+                WHERE p.is_deleted = FALSE
+                  AND (
+                    p.visibility = 'public'
+                    OR p.user_id = %s
+                    OR (
+                        p.visibility = 'followers'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM public.mg_social_follows f
+                            WHERE f.follower_id = %s
+                              AND f.following_id = p.user_id
+                        )
+                    )
+                  )
+                ORDER BY p.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user["id"], user["id"], limit, offset)
+            )
+
+            rows = cursor.fetchall()
+
+            posts = []
+            for row in rows:
+                cursor.execute("""
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM public.mg_social_likes
+                        WHERE post_id = %s AND user_id = %s
+                    )
+                """, (row[0], user["id"]))
+
+                liked = cursor.fetchone()[0]
+                posts.append(social_post_dict(row, liked))
+
+    return {
+        "success": True,
+        "limit": limit,
+        "offset": offset,
+        "count": len(posts),
+        "posts": posts
+    }
+
+
+# ---------------------------------------------------------
+# GET SINGLE POST
+# ---------------------------------------------------------
+
+@app.get("/api/v1/social/posts/{post_id}")
+def get_social_post(
+    post_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute(
+                SOCIAL_POST_SELECT + """
+                WHERE p.id = %s AND p.is_deleted = FALSE
+                """,
+                (post_id,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Post not found")
+
+            if row[6] == "private" and row[1] != uuid.UUID(user["id"]):
+                raise HTTPException(status_code=403, detail="Private post")
+
+            if row[6] == "followers" and row[1] != uuid.UUID(user["id"]):
+                cursor.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM public.mg_social_follows
+                        WHERE follower_id = %s AND following_id = %s
+                    )
+                """, (user["id"], row[1]))
+
+                if not cursor.fetchone()[0]:
+                    raise HTTPException(status_code=403, detail="Followers only")
+
+            cursor.execute("""
+                UPDATE public.mg_social_posts
+                SET views_count = views_count + 1
+                WHERE id = %s
+            """, (post_id,))
+
+            cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM public.mg_social_likes
+                    WHERE post_id = %s AND user_id = %s
+                )
+            """, (post_id, user["id"]))
+
+            liked = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "post": social_post_dict(row, liked)
+    }
+
+
+# ---------------------------------------------------------
+# DELETE OWN POST
+# ---------------------------------------------------------
+
+@app.delete("/api/v1/social/posts/{post_id}")
+def delete_social_post(
+    post_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_social_posts
+                SET is_deleted = TRUE,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND user_id = %s
+                  AND is_deleted = FALSE
+            """, (post_id, user["id"]))
+
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Post not found or access denied"
+                )
+
+            global_audit(
+                cursor,
+                user["id"],
+                "social.post.delete",
+                "post",
+                post_id
+            )
+
+    return {"success": True, "message": "Post deleted"}
+
+
+# ---------------------------------------------------------
+# LIKE POST
+# ---------------------------------------------------------
+
+@app.post("/api/v1/social/posts/{post_id}/like")
+def like_social_post(
+    post_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO public.mg_social_likes(post_id, user_id)
+                SELECT id, %s
+                FROM public.mg_social_posts
+                WHERE id = %s AND is_deleted = FALSE
+                ON CONFLICT(post_id, user_id) DO NOTHING
+                RETURNING id
+            """, (user["id"], post_id))
+
+            inserted = cursor.fetchone()
+
+            if inserted:
+                cursor.execute("""
+                    UPDATE public.mg_social_posts
+                    SET likes_count = likes_count + 1
+                    WHERE id = %s
+                """, (post_id,))
+
+    return {
+        "success": True,
+        "liked": True,
+        "already_liked": inserted is None
+    }
+
+
+# ---------------------------------------------------------
+# UNLIKE POST
+# ---------------------------------------------------------
+
+@app.delete("/api/v1/social/posts/{post_id}/like")
+def unlike_social_post(
+    post_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM public.mg_social_likes
+                WHERE post_id = %s AND user_id = %s
+                RETURNING id
+            """, (post_id, user["id"]))
+
+            removed = cursor.fetchone()
+
+            if removed:
+                cursor.execute("""
+                    UPDATE public.mg_social_posts
+                    SET likes_count = GREATEST(0, likes_count - 1)
+                    WHERE id = %s
+                """, (post_id,))
+
+    return {
+        "success": True,
+        "liked": False,
+        "removed": removed is not None
+    }
+
+
+# ---------------------------------------------------------
+# CREATE COMMENT
+# ---------------------------------------------------------
+
+@app.post("/api/v1/social/posts/{post_id}/comments")
+def create_social_comment(
+    post_id: uuid.UUID,
+    data: GlobalCommentCreate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT user_id, visibility
+                FROM public.mg_social_posts
+                WHERE id = %s AND is_deleted = FALSE
+                FOR UPDATE
+            """, (post_id,))
+
+            post = cursor.fetchone()
+
+            if not post:
+                raise HTTPException(status_code=404, detail="Post not found")
+
+            if post[1] == "private" and str(post[0]) != user["id"]:
+                raise HTTPException(status_code=403, detail="Private post")
+
+            cursor.execute("""
+                INSERT INTO public.mg_social_comments (
+                    post_id, user_id, content
+                )
+                VALUES (%s,%s,%s)
+                RETURNING id, created_at
+            """, (post_id, user["id"], data.content.strip()))
+
+            comment = cursor.fetchone()
+
+            cursor.execute("""
+                UPDATE public.mg_social_posts
+                SET comments_count = comments_count + 1
+                WHERE id = %s
+            """, (post_id,))
+
+            if str(post[0]) != user["id"]:
+                create_global_notification(
+                    cursor,
+                    post[0],
+                    "post_comment",
+                    "دیدگاه جدید",
+                    "برای پست شما دیدگاه ثبت شد",
+                    user["id"],
+                    "post",
+                    post_id
+                )
+
+    return {
+        "success": True,
+        "comment": {
+            "id": str(comment[0]),
+            "created_at": comment[1].isoformat()
+        }
+    }
+
+
+# ---------------------------------------------------------
+# LIST COMMENTS
+# ---------------------------------------------------------
+
+@app.get("/api/v1/social/posts/{post_id}/comments")
+def list_social_comments(
+    post_id: uuid.UUID,
+    limit: int = 30,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT visibility, user_id
+                FROM public.mg_social_posts
+                WHERE id = %s AND is_deleted = FALSE
+            """, (post_id,))
+
+            post = cursor.fetchone()
+
+            if not post:
+                raise HTTPException(status_code=404, detail="Post not found")
+
+            if post[0] == "private" and str(post[1]) != user["id"]:
+                raise HTTPException(status_code=403, detail="Private post")
+
+            cursor.execute("""
+                SELECT
+                    c.id,
+                    c.content,
+                    c.created_at,
+                    u.id,
+                    u.username,
+                    u.display_name
+                FROM public.mg_social_comments c
+                JOIN public.mg_users u ON u.id = c.user_id
+                WHERE c.post_id = %s
+                  AND c.is_deleted = FALSE
+                ORDER BY c.created_at ASC
+                LIMIT %s OFFSET %s
+            """, (post_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "comments": [
+            {
+                "id": str(r[0]),
+                "content": r[1],
+                "created_at": r[2].isoformat(),
+                "user": {
+                    "id": str(r[3]),
+                    "username": r[4],
+                    "display_name": r[5]
+                }
+            }
+            for r in rows
+        ]
+    }
+
+
+# ---------------------------------------------------------
+# DELETE OWN COMMENT
+# ---------------------------------------------------------
+
+@app.delete("/api/v1/social/comments/{comment_id}")
+def delete_social_comment(
+    comment_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT post_id
+                FROM public.mg_social_comments
+                WHERE id = %s
+                  AND user_id = %s
+                  AND is_deleted = FALSE
+                FOR UPDATE
+            """, (comment_id, user["id"]))
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Comment not found or access denied"
+                )
+
+            cursor.execute("""
+                UPDATE public.mg_social_comments
+                SET is_deleted = TRUE,
+                    updated_at = NOW()
+                WHERE id = %s
+            """, (comment_id,))
+
+            cursor.execute("""
+                UPDATE public.mg_social_posts
+                SET comments_count = GREATEST(0, comments_count - 1)
+                WHERE id = %s
+            """, (row[0],))
+
+    return {"success": True, "message": "Comment deleted"}
+
+
+# =========================================================
+# END MODULE 02
+# NEXT: FOLLOW SYSTEM + PROFILES + CREATOR BADGE
+# =========================================================
