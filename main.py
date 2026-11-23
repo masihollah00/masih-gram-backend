@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 MIGRATION_VERSION = "001_initial_core"
 AUTH_MIGRATION_VERSION = "002_auth_engine"
 
@@ -73,6 +73,11 @@ def get_connection():
             status_code=503,
             detail="Database connection failed"
         )
+
+
+# Backward-compatible database accessor used by the feature modules.
+def get_db():
+    return get_connection()
 
 
 def utcnow():
@@ -5847,13 +5852,20 @@ def check_messaging_permission_api(
 # REPORT A MESSAGING ABUSE
 # ------------------------------------------------------------
 
+class MessagingReportCreate(BaseModel):
+    reported_user_id: str
+    reason: str
+    description: Optional[str] = None
+
+
 @app.post("/api/v1/messaging/reports")
 def report_messaging_user(
-    reported_user_id: str = Field(...),
-    reason: str = Field(...),
-    description: Optional[str] = None,
+    payload: MessagingReportCreate,
     authorization: Optional[str] = Header(None)
 ):
+    reported_user_id = payload.reported_user_id
+    reason = payload.reason
+    description = payload.description
     user = messaging_user(authorization)
     target_id = messaging_uuid(reported_user_id)
 
@@ -10295,7 +10307,7 @@ def mg18_admin(authorization):
     global_admin_check(authorization)
 
 
-@app.get("/api/v1/system/health")
+@app.get("/api/v1/system/health/detailed")
 def mg18_health():
     started = mg18_time.perf_counter()
 
