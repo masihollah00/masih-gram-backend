@@ -6712,3 +6712,418 @@ def get_event_queue_statistics(
 # END SECTION 9
 # NEXT: MEDIA STORAGE & SECURE UPLOAD ENGINE
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL — SECTION 10
+# AUDIT TRAIL & SECURITY HISTORY ENGINE
+# ============================================================
+
+import json as audit_json
+import re as audit_re
+from datetime import datetime, timezone
+from typing import Optional
+
+from pydantic import BaseModel, Field
+from fastapi import Query, Header, HTTPException
+
+
+AUDIT_ENGINE_VERSION = "10.0.0"
+AUDIT_MAX_METADATA_BYTES = 12000
+AUDIT_MAX_PAGE_SIZE = 100
+
+AUDIT_SENSITIVE_KEYS = {
+    "password", "passwd", "token", "access_token",
+    "refresh_token", "authorization", "secret",
+    "otp", "otp_code", "api_key", "private_key",
+    "phone", "email", "cookie", "session_token"
+}
+
+
+class AuditEventCreate(BaseModel):
+    action: str = Field(min_length=2, max_length=100)
+    target_type: Optional[str] = Field(default=None, max_length=80)
+    target_id: Optional[str] = Field(default=None, max_length=150)
+    metadata: dict = Field(default_factory=dict)
+
+
+class AuditAdminQuery(BaseModel):
+    action: Optional[str] = Field(default=None, max_length=100)
+    actor_id: Optional[str] = Field(default=None, max_length=150)
+
+
+def audit_clean_text(value, maximum=500):
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value[:maximum] if value else None
+
+
+def audit_clean_metadata(value, depth=0):
+    if depth > 5:
+        return "[MAX_DEPTH]"
+
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in list(value.items())[:60]:
+            safe_key = audit_clean_text(key, 80)
+            if not safe_key:
+                continue
+
+            if safe_key.lower() in AUDIT_SENSITIVE_KEYS:
+                cleaned[safe_key] = "[REDACTED]"
+            else:
+                cleaned[safe_key] = audit_clean_metadata(item, depth + 1)
+
+        return cleaned
+
+    if isinstance(value, list):
+        return [
+            audit_clean_metadata(item, depth + 1)
+            for item in value[:60]
+        ]
+
+    if isinstance(value, str):
+        return value[:2000]
+
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+
+    return audit_clean_text(value, 500)
+
+
+def audit_validate_action(action):
+    action = audit_clean_text(action, 100)
+
+    if not action:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid audit action"
+        )
+
+    if not audit_re.fullmatch(r"[a-zA-Z0-9_.:-]+", action):
+        raise HTTPException(
+            status_code=400,
+            detail="Audit action contains invalid characters"
+        )
+
+    return action
+
+
+def audit_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_audit_trail (
+            id BIGSERIAL PRIMARY KEY,
+            event_id UUID NOT NULL UNIQUE,
+            actor_user_id TEXT,
+            actor_role VARCHAR(40) NOT NULL DEFAULT 'user',
+            action VARCHAR(100) NOT NULL,
+            target_type VARCHAR(80),
+            target_id VARCHAR(150),
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_audit_actor_time
+        ON mg_audit_trail(actor_user_id, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_audit_action_time
+        ON mg_audit_trail(action, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_audit_target
+        ON mg_audit_trail(target_type, target_id)
+    """)
+
+
+def audit_write(
+    cursor,
+    actor_user_id,
+    action,
+    actor_role="user",
+    target_type=None,
+    target_id=None,
+    metadata=None
+):
+    action = audit_validate_action(action)
+
+    clean_metadata = audit_clean_metadata(
+        metadata if isinstance(metadata, dict) else {}
+    )
+
+    serialized = audit_json.dumps(
+        clean_metadata,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    if len(serialized.encode("utf-8")) > AUDIT_MAX_METADATA_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Audit metadata is too large"
+        )
+
+    import uuid as audit_uuid_lib
+
+    event_id = str(audit_uuid_lib.uuid4())
+
+    cursor.execute("""
+        INSERT INTO mg_audit_trail (
+            event_id,
+            actor_user_id,
+            actor_role,
+            action,
+            target_type,
+            target_id,
+            metadata
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s::jsonb
+        )
+        RETURNING id, event_id, created_at
+    """, (
+        event_id,
+        str(actor_user_id) if actor_user_id is not None else None,
+        audit_clean_text(actor_role, 40) or "user",
+        action,
+        audit_clean_text(target_type, 80),
+        audit_clean_text(target_id, 150),
+        serialized
+    ))
+
+    return cursor.fetchone()
+
+
+def audit_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = getattr(user, "id", None)
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authenticated user ID is missing"
+        )
+
+    return str(value)
+
+
+def audit_row_to_dict(row):
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "event_id": str(row[1]),
+        "actor_user_id": row[2],
+        "actor_role": row[3],
+        "action": row[4],
+        "target_type": row[5],
+        "target_id": row[6],
+        "metadata": row[7],
+        "created_at": row[8].isoformat() if row[8] else None
+    }
+
+
+@app.post("/api/v1/admin/migrations/audit/apply")
+def apply_audit_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            audit_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "MASIH GRAM AUDIT TRAIL",
+        "version": AUDIT_ENGINE_VERSION,
+        "message": "Audit schema is ready"
+    }
+
+
+@app.get("/api/v1/security/audit/me")
+def get_my_audit_history(
+    limit: int = Query(default=50, ge=1, le=AUDIT_MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0, le=100000),
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = audit_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            audit_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    id, event_id, actor_user_id, actor_role,
+                    action, target_type, target_id,
+                    metadata, created_at
+                FROM mg_audit_trail
+                WHERE actor_user_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s OFFSET %s
+            """, (user_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "items": [audit_row_to_dict(row) for row in rows],
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.get("/api/v1/admin/audit/events")
+def admin_get_audit_events(
+    limit: int = Query(default=50, ge=1, le=AUDIT_MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0, le=100000),
+    action: Optional[str] = Query(default=None, max_length=100),
+    actor_id: Optional[str] = Query(default=None, max_length=150),
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    conditions = []
+    params = []
+
+    if action:
+        conditions.append("action = %s")
+        params.append(audit_validate_action(action))
+
+    if actor_id:
+        conditions.append("actor_user_id = %s")
+        params.append(audit_clean_text(actor_id, 150))
+
+    where_sql = (
+        "WHERE " + " AND ".join(conditions)
+        if conditions else ""
+    )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            audit_require_schema(cursor)
+
+            cursor.execute(f"""
+                SELECT
+                    id, event_id, actor_user_id, actor_role,
+                    action, target_type, target_id,
+                    metadata, created_at
+                FROM mg_audit_trail
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s OFFSET %s
+            """, tuple(params + [limit, offset]))
+
+            rows = cursor.fetchall()
+
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM mg_audit_trail
+                {where_sql}
+            """, tuple(params))
+
+            total = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "total": total,
+        "items": [audit_row_to_dict(row) for row in rows],
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.post("/api/v1/security/audit/event")
+def create_my_audit_event(
+    data: AuditEventCreate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = audit_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            audit_require_schema(cursor)
+
+            result = audit_write(
+                cursor=cursor,
+                actor_user_id=user_id,
+                action=data.action,
+                actor_role="user",
+                target_type=data.target_type,
+                target_id=data.target_id,
+                metadata=data.metadata
+            )
+
+    return {
+        "success": True,
+        "event": {
+            "id": result[0],
+            "event_id": str(result[1]),
+            "created_at": (
+                result[2].isoformat()
+                if result[2] else None
+            )
+        }
+    }
+
+
+@app.get("/api/v1/admin/audit/statistics")
+def get_audit_statistics(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            audit_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*) AS total_events,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '24 hours'
+                    ) AS last_24_hours,
+                    COUNT(DISTINCT actor_user_id) AS active_actors
+                FROM mg_audit_trail
+            """)
+
+            summary = cursor.fetchone()
+
+            cursor.execute("""
+                SELECT action, COUNT(*) AS total
+                FROM mg_audit_trail
+                WHERE created_at >= NOW() - INTERVAL '7 days'
+                GROUP BY action
+                ORDER BY total DESC
+                LIMIT 20
+            """)
+
+            popular_actions = cursor.fetchall()
+
+    return {
+        "success": True,
+        "statistics": {
+            "total_events": summary[0],
+            "last_24_hours": summary[1],
+            "active_actors": summary[2]
+        },
+        "popular_actions": [
+            {"action": row[0], "total": row[1]}
+            for row in popular_actions
+        ]
+    }
+
+# END OF SECTION 10
