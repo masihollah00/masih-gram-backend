@@ -5299,3 +5299,803 @@ def get_my_security_events(
 # END SECTION 7
 # NEXT: GLOBAL MESSAGING PERMISSIONS & ANTI-SPAM ENGINE
 # ============================================================
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 8 — MESSAGING PERMISSIONS & ANTI-SPAM ENGINE
+# ============================================================
+
+import hashlib as messaging_hashlib
+import uuid as messaging_uuid
+
+from pydantic import BaseModel, Field
+
+
+MESSAGING_ENGINE_VERSION = "1.0.0"
+
+# Default protection limits.
+# These are server-side policy values, not client-controlled.
+MSG_MAX_PER_MINUTE = 8
+MSG_MAX_PER_TEN_MINUTES = 30
+MSG_MAX_PER_RECIPIENT_PER_HOUR = 12
+
+
+# ------------------------------------------------------------
+# REQUEST MODELS
+# ------------------------------------------------------------
+
+class MessagingPolicyUpdate(BaseModel):
+    allow_messages_from: str = Field(
+        ...,
+        pattern="^(everyone|followers|nobody)$"
+    )
+
+
+class MessagingPermissionCheck(BaseModel):
+    recipient_id: str = Field(..., min_length=1, max_length=64)
+
+
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
+
+def messaging_user(authorization):
+    user = global_user(authorization)
+
+    if not user or not user.get("id"):
+        raise HTTPException(
+            status_code=401,
+            detail="احراز هویت معتبر نیست"
+        )
+
+    return user
+
+
+def messaging_uuid(value):
+    try:
+        return messaging_uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="شناسه کاربر معتبر نیست"
+        )
+
+
+def messaging_require_schema(cursor):
+    cursor.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name IN (
+              'mg_message_policies',
+              'mg_message_rate_events',
+              'mg_message_reports'
+          )
+    """)
+
+    found = {row["table_name"] for row in cursor.fetchall()}
+
+    required = {
+        "mg_message_policies",
+        "mg_message_rate_events",
+        "mg_message_reports",
+    }
+
+    if found != required:
+        raise HTTPException(
+            status_code=503,
+            detail="مهاجرت موتور پیام‌رسانی اجرا نشده است"
+        )
+
+
+# ------------------------------------------------------------
+# DATABASE MIGRATION
+# ------------------------------------------------------------
+
+@app.post("/api/v1/admin/migrations/messaging/apply")
+def apply_messaging_migration(
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    configured_key = os.getenv("ADMIN_API_KEY")
+
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="کلید مدیریت سرور تنظیم نشده است"
+        )
+
+    if not x_admin_key or not hmac.compare_digest(
+        str(x_admin_key),
+        str(configured_key)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="دسترسی مدیریت مجاز نیست"
+        )
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS mg_message_policies (
+            user_id UUID PRIMARY KEY
+                REFERENCES mg_users(id) ON DELETE CASCADE,
+            allow_messages_from VARCHAR(20)
+                NOT NULL DEFAULT 'everyone',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                allow_messages_from IN (
+                    'everyone',
+                    'followers',
+                    'nobody'
+                )
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mg_message_rate_events (
+            id BIGSERIAL PRIMARY KEY,
+            sender_id UUID NOT NULL
+                REFERENCES mg_users(id) ON DELETE CASCADE,
+            recipient_id UUID NOT NULL
+                REFERENCES mg_users(id) ON DELETE CASCADE,
+            idempotency_key VARCHAR(100),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (sender_id <> recipient_id)
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_message_rate_idempotency
+        ON mg_message_rate_events(sender_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_message_rate_sender_time
+        ON mg_message_rate_events(sender_id, created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_message_rate_recipient_time
+        ON mg_message_rate_events(
+            sender_id,
+            recipient_id,
+            created_at DESC
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mg_message_reports (
+            id UUID PRIMARY KEY,
+            reporter_id UUID NOT NULL
+                REFERENCES mg_users(id) ON DELETE CASCADE,
+            reported_user_id UUID NOT NULL
+                REFERENCES mg_users(id) ON DELETE CASCADE,
+            reason VARCHAR(80) NOT NULL,
+            description VARCHAR(1000),
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reviewed_at TIMESTAMPTZ,
+            admin_note VARCHAR(1000),
+            CHECK (reporter_id <> reported_user_id),
+            CHECK (
+                status IN (
+                    'pending',
+                    'reviewed',
+                    'dismissed',
+                    'action_taken'
+                )
+            )
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_message_reports_status
+        ON mg_message_reports(status, created_at DESC)
+        """,
+    ]
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            for statement in statements:
+                cursor.execute(statement)
+
+    return {
+        "success": True,
+        "migration": "messaging_permissions_antispam",
+        "version": MESSAGING_ENGINE_VERSION,
+    }
+
+
+# ------------------------------------------------------------
+# POLICY HELPERS
+# ------------------------------------------------------------
+
+def messaging_get_policy(cursor, user_id):
+    cursor.execute(
+        """
+        INSERT INTO mg_message_policies(user_id)
+        VALUES (%s)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+
+    cursor.execute(
+        """
+        SELECT allow_messages_from
+        FROM mg_message_policies
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+
+    row = cursor.fetchone()
+
+    return row["allow_messages_from"] if row else "everyone"
+
+
+def messaging_check_permission(
+    cursor,
+    sender_id,
+    recipient_id
+):
+    if str(sender_id) == str(recipient_id):
+        return {
+            "allowed": False,
+            "reason": "self_message_not_allowed"
+        }
+
+    cursor.execute(
+        "SELECT id FROM mg_users WHERE id = %s",
+        (recipient_id,),
+    )
+
+    if not cursor.fetchone():
+        return {
+            "allowed": False,
+            "reason": "recipient_not_found"
+        }
+
+    # The privacy migration from Section 7 must exist.
+    privacy_require_schema(cursor)
+
+    if privacy_is_blocked(cursor, sender_id, recipient_id):
+        return {
+            "allowed": False,
+            "reason": "blocked"
+        }
+
+    policy = messaging_get_policy(cursor, recipient_id)
+
+    if policy == "nobody":
+        return {
+            "allowed": False,
+            "reason": "messages_disabled"
+        }
+
+    if policy == "followers":
+        if not privacy_is_following(
+            cursor,
+            sender_id,
+            recipient_id
+        ):
+            return {
+                "allowed": False,
+                "reason": "followers_only"
+            }
+
+    return {
+        "allowed": True,
+        "reason": None
+    }
+
+
+# ------------------------------------------------------------
+# ATOMIC RATE LIMIT RESERVATION
+#
+# IMPORTANT:
+# Call this inside the same database transaction as the
+# actual message insertion. Do not call it from a separate
+# transaction and assume it guarantees message delivery.
+# ------------------------------------------------------------
+
+def messaging_reserve_send(
+    cursor,
+    sender_id,
+    recipient_id,
+    idempotency_key=None
+):
+    sender_id = messaging_uuid(sender_id)
+    recipient_id = messaging_uuid(recipient_id)
+
+    if sender_id == recipient_id:
+        raise HTTPException(
+            status_code=400,
+            detail="ارسال پیام به حساب خودتان مجاز نیست"
+        )
+
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
+
+        if not idempotency_key or len(idempotency_key) > 100:
+            raise HTTPException(
+                status_code=400,
+                detail="کلید درخواست تکراری معتبر نیست"
+            )
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM mg_message_rate_events
+            WHERE sender_id = %s
+              AND idempotency_key = %s
+            """,
+            (sender_id, idempotency_key),
+        )
+
+        if cursor.fetchone():
+            return {
+                "allowed": False,
+                "duplicate": True,
+                "reason": "duplicate_request"
+            }
+
+    permission = messaging_check_permission(
+        cursor,
+        sender_id,
+        recipient_id
+    )
+
+    if not permission["allowed"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": permission["reason"],
+                "message": "امکان ارسال پیام به این کاربر وجود ندارد"
+            }
+        )
+
+    # Serialize concurrent sends from the same account.
+    # PostgreSQL releases this transaction lock automatically.
+    lock_key = messaging_hashlib.sha256(
+        str(sender_id).encode("utf-8")
+    ).hexdigest()[:16]
+
+    lock_number = int(lock_key, 16)
+
+    if lock_number >= 2 ** 63:
+        lock_number -= 2 ** 64
+
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(%s)",
+        (lock_number,),
+    )
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (
+                WHERE created_at >= NOW() - INTERVAL '1 minute'
+            ) AS minute_count,
+            COUNT(*) FILTER (
+                WHERE created_at >= NOW() - INTERVAL '10 minutes'
+            ) AS ten_minute_count,
+            COUNT(*) FILTER (
+                WHERE recipient_id = %s
+                  AND created_at >= NOW() - INTERVAL '1 hour'
+            ) AS recipient_hour_count
+        FROM mg_message_rate_events
+        WHERE sender_id = %s
+          AND created_at >= NOW() - INTERVAL '10 minutes'
+        """,
+        (recipient_id, sender_id),
+    )
+
+    counts = cursor.fetchone()
+
+    if counts["minute_count"] >= MSG_MAX_PER_MINUTE:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "message_rate_limit_minute",
+                "message": "تعداد پیام‌های شما در این بازه بیش از حد مجاز است"
+            },
+            headers={"Retry-After": "60"},
+        )
+
+    if counts["ten_minute_count"] >= MSG_MAX_PER_TEN_MINUTES:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "message_rate_limit_ten_minutes",
+                "message": "برای ارسال پیام بیشتر کمی صبر کنید"
+            },
+            headers={"Retry-After": "600"},
+        )
+
+    if counts["recipient_hour_count"] >= MSG_MAX_PER_RECIPIENT_PER_HOUR:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "recipient_rate_limit",
+                "message": "ارسال پیام به این کاربر موقتاً محدود شده است"
+            },
+            headers={"Retry-After": "3600"},
+        )
+
+    cursor.execute(
+        """
+        INSERT INTO mg_message_rate_events(
+            sender_id,
+            recipient_id,
+            idempotency_key
+        )
+        VALUES (%s, %s, %s)
+        RETURNING id, created_at
+        """,
+        (sender_id, recipient_id, idempotency_key),
+    )
+
+    event = cursor.fetchone()
+
+    return {
+        "allowed": True,
+        "duplicate": False,
+        "reservation_id": event["id"],
+        "created_at": event["created_at"].isoformat()
+    }
+
+
+# ------------------------------------------------------------
+# USER MESSAGE POLICY
+# ------------------------------------------------------------
+
+@app.get("/api/v1/messaging/policy")
+def get_my_messaging_policy(
+    authorization: Optional[str] = Header(None)
+):
+    user = messaging_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            policy = messaging_get_policy(
+                cursor,
+                user["id"]
+            )
+
+    return {
+        "success": True,
+        "allow_messages_from": policy
+    }
+
+
+@app.patch("/api/v1/messaging/policy")
+def update_my_messaging_policy(
+    payload: MessagingPolicyUpdate,
+    authorization: Optional[str] = Header(None)
+):
+    user = messaging_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            cursor.execute(
+                """
+                INSERT INTO mg_message_policies(
+                    user_id,
+                    allow_messages_from
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    allow_messages_from = EXCLUDED.allow_messages_from,
+                    updated_at = NOW()
+                RETURNING allow_messages_from, updated_at
+                """,
+                (
+                    user["id"],
+                    payload.allow_messages_from
+                ),
+            )
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "allow_messages_from": row["allow_messages_from"],
+        "updated_at": row["updated_at"].isoformat()
+    }
+
+
+# ------------------------------------------------------------
+# PRE-SEND PERMISSION CHECK
+# This endpoint checks permission only.
+# It does NOT send or reserve a message.
+# ------------------------------------------------------------
+
+@app.post("/api/v1/messaging/permission/check")
+def check_messaging_permission_api(
+    payload: MessagingPermissionCheck,
+    authorization: Optional[str] = Header(None)
+):
+    user = messaging_user(authorization)
+    recipient_id = messaging_uuid(payload.recipient_id)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            result = messaging_check_permission(
+                cursor,
+                user["id"],
+                recipient_id
+            )
+
+    return {
+        "success": True,
+        "allowed": result["allowed"],
+        "reason": result["reason"]
+    }
+
+
+# ------------------------------------------------------------
+# REPORT A MESSAGING ABUSE
+# ------------------------------------------------------------
+
+@app.post("/api/v1/messaging/reports")
+def report_messaging_user(
+    reported_user_id: str = Field(...),
+    reason: str = Field(...),
+    description: Optional[str] = None,
+    authorization: Optional[str] = Header(None)
+):
+    user = messaging_user(authorization)
+    target_id = messaging_uuid(reported_user_id)
+
+    allowed_reasons = {
+        "spam",
+        "harassment",
+        "impersonation",
+        "scam",
+        "other"
+    }
+
+    reason = str(reason).strip().lower()
+
+    if reason not in allowed_reasons:
+        raise HTTPException(
+            status_code=400,
+            detail="دلیل گزارش معتبر نیست"
+        )
+
+    if description is not None and len(description) > 1000:
+        raise HTTPException(
+            status_code=400,
+            detail="توضیحات گزارش بیش از حد مجاز است"
+        )
+
+    if str(user["id"]) == str(target_id):
+        raise HTTPException(
+            status_code=400,
+            detail="گزارش حساب خودتان مجاز نیست"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            cursor.execute(
+                "SELECT id FROM mg_users WHERE id = %s",
+                (target_id,),
+            )
+
+            if not cursor.fetchone():
+                raise HTTPException(
+                    status_code=404,
+                    detail="کاربر پیدا نشد"
+                )
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM mg_message_reports
+                WHERE reporter_id = %s
+                  AND reported_user_id = %s
+                  AND status = 'pending'
+                LIMIT 1
+                """,
+                (user["id"], target_id),
+            )
+
+            if cursor.fetchone():
+                return {
+                    "success": True,
+                    "already_reported": True
+                }
+
+            report_id = messaging_uuid.uuid4()
+
+            cursor.execute(
+                """
+                INSERT INTO mg_message_reports(
+                    id,
+                    reporter_id,
+                    reported_user_id,
+                    reason,
+                    description
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    report_id,
+                    user["id"],
+                    target_id,
+                    reason,
+                    description,
+                ),
+            )
+
+    return {
+        "success": True,
+        "report_id": str(report_id),
+        "status": "pending"
+    }
+
+
+# ------------------------------------------------------------
+# USER REPORT HISTORY
+# ------------------------------------------------------------
+
+@app.get("/api/v1/messaging/reports/me")
+def get_my_messaging_reports(
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    authorization: Optional[str] = Header(None)
+):
+    user = messaging_user(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    reported_user_id,
+                    reason,
+                    description,
+                    status,
+                    created_at,
+                    reviewed_at
+                FROM mg_message_reports
+                WHERE reporter_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user["id"], limit, offset),
+            )
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": str(row["id"]),
+                "reported_user_id": str(row["reported_user_id"]),
+                "reason": row["reason"],
+                "description": row["description"],
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat(),
+                "reviewed_at": (
+                    row["reviewed_at"].isoformat()
+                    if row["reviewed_at"] else None
+                )
+            }
+            for row in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+
+# ------------------------------------------------------------
+# ADMIN REPORT QUEUE
+# ------------------------------------------------------------
+
+@app.get("/api/v1/admin/messaging/reports")
+def admin_messaging_reports(
+    status: str = Query("pending"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    x_admin_key: Optional[str] = Header(
+        None,
+        alias="x-admin-key"
+    )
+):
+    configured_key = os.getenv("ADMIN_API_KEY")
+
+    if not configured_key or not x_admin_key or not hmac.compare_digest(
+        str(x_admin_key),
+        str(configured_key)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="دسترسی مدیریت مجاز نیست"
+        )
+
+    allowed_statuses = {
+        "pending",
+        "reviewed",
+        "dismissed",
+        "action_taken",
+        "all"
+    }
+
+    if status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail="وضعیت گزارش معتبر نیست"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            messaging_require_schema(cursor)
+
+            if status == "all":
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM mg_message_reports
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (limit, offset),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM mg_message_reports
+                    WHERE status = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (status, limit, offset),
+                )
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": str(row["id"]),
+                "reporter_id": str(row["reporter_id"]),
+                "reported_user_id": str(row["reported_user_id"]),
+                "reason": row["reason"],
+                "description": row["description"],
+                "status": row["status"],
+                "created_at": row["created_at"].isoformat(),
+            }
+            for row in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+
+# ============================================================
+# END SECTION 8
+# NEXT: GLOBAL RELIABLE EVENT & NOTIFICATION DELIVERY ENGINE
+# ============================================================
