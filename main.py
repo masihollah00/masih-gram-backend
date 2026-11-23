@@ -7959,3 +7959,471 @@ def managed_device_heartbeat(
 
 
 # END OF SECTION 12
+
+# ============================================================
+# MASIH GRAM GLOBAL
+# SECTION 13 — STORAGE METADATA ENGINE
+# ============================================================
+
+import uuid as storage_uuid_lib
+import re as storage_re
+
+from typing import Optional
+from pydantic import BaseModel, Field
+from fastapi import Header, HTTPException, Query
+
+
+STORAGE_ENGINE_VERSION = "13.0.0"
+STORAGE_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
+
+STORAGE_CATEGORIES = {
+    "image", "video", "audio", "document", "other"
+}
+
+
+class StorageRegisterRequest(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    file_category: str
+    mime_type: str = Field(min_length=3, max_length=150)
+    file_size: int = Field(gt=0, le=STORAGE_MAX_FILE_SIZE)
+    storage_key: str = Field(min_length=8, max_length=500)
+    checksum: Optional[str] = Field(default=None, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+
+class StorageUpdateRequest(BaseModel):
+    file_name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+
+def storage_user_id(user):
+    if isinstance(user, dict):
+        value = user.get("id") or user.get("user_id")
+    else:
+        value = (
+            getattr(user, "id", None)
+            or getattr(user, "user_id", None)
+        )
+
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User identity unavailable"
+        )
+
+    return str(value)
+
+
+def storage_validate_name(value):
+    value = str(value).strip()
+
+    if not value or len(value) > 255:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid file name"
+        )
+
+    if "/" in value or "\\" in value:
+        raise HTTPException(
+            status_code=422,
+            detail="File name must not contain a path"
+        )
+
+    return value
+
+
+def storage_validate_key(value):
+    value = str(value).strip()
+
+    if not 8 <= len(value) <= 500:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid storage key"
+        )
+
+    if not storage_re.fullmatch(r"[A-Za-z0-9_.:/-]+", value):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid storage key characters"
+        )
+
+    return value
+
+
+def storage_require_schema(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mg_storage_objects (
+            id UUID PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            file_category VARCHAR(30) NOT NULL,
+            mime_type VARCHAR(150) NOT NULL,
+            file_size BIGINT NOT NULL CHECK (file_size > 0),
+            storage_key VARCHAR(500) NOT NULL,
+            checksum VARCHAR(128),
+            description VARCHAR(1000),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            deleted_at TIMESTAMPTZ
+        )
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_mg_storage_active_key
+        ON mg_storage_objects(user_id, storage_key)
+        WHERE deleted_at IS NULL
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_storage_user_created
+        ON mg_storage_objects(user_id, created_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_mg_storage_category
+        ON mg_storage_objects(user_id, file_category)
+        WHERE deleted_at IS NULL
+    """)
+
+
+def storage_row(row):
+    return {
+        "file_id": str(row[0]),
+        "file_name": row[1],
+        "file_category": row[2],
+        "mime_type": row[3],
+        "file_size": row[4],
+        "storage_key": row[5],
+        "checksum": row[6],
+        "description": row[7],
+        "created_at": row[8].isoformat() if row[8] else None,
+        "updated_at": row[9].isoformat() if row[9] else None
+    }
+
+
+@app.post("/api/v1/admin/migrations/storage/apply")
+def apply_storage_migration(
+    authorization: Optional[str] = Header(default=None)
+):
+    global_admin_check(authorization)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+    return {
+        "success": True,
+        "engine": "STORAGE METADATA ENGINE",
+        "version": STORAGE_ENGINE_VERSION
+    }
+
+
+@app.post("/api/v1/storage/register")
+def register_storage_object(
+    data: StorageRegisterRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = storage_user_id(user)
+
+    file_name = storage_validate_name(data.file_name)
+    storage_key = storage_validate_key(data.storage_key)
+
+    category = data.file_category.strip().lower()
+
+    if category not in STORAGE_CATEGORIES:
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported file category"
+        )
+
+    mime_type = data.mime_type.strip().lower()
+
+    if "/" not in mime_type or any(ch.isspace() for ch in mime_type):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid MIME type"
+        )
+
+    if data.checksum and not storage_re.fullmatch(
+        r"[A-Fa-f0-9]{32,128}",
+        data.checksum
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid checksum"
+        )
+
+    file_id = str(storage_uuid_lib.uuid4())
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO mg_storage_objects (
+                    id, user_id, file_name, file_category,
+                    mime_type, file_size, storage_key,
+                    checksum, description
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+                RETURNING
+                    id, file_name, file_category,
+                    mime_type, file_size, storage_key,
+                    checksum, description, created_at, updated_at
+            """, (
+                file_id,
+                user_id,
+                file_name,
+                category,
+                mime_type,
+                data.file_size,
+                storage_key,
+                data.checksum,
+                data.description
+            ))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "file": storage_row(row)
+    }
+
+
+@app.get("/api/v1/storage/files")
+def list_storage_objects(
+    category: Optional[str] = Query(default=None, max_length=30),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=100000),
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = storage_user_id(user)
+
+    if category and category not in STORAGE_CATEGORIES:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid category"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+            if category:
+                cursor.execute("""
+                    SELECT
+                        id, file_name, file_category,
+                        mime_type, file_size, storage_key,
+                        checksum, description, created_at, updated_at
+                    FROM mg_storage_objects
+                    WHERE user_id = %s
+                    AND file_category = %s
+                    AND deleted_at IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user_id, category, limit, offset))
+            else:
+                cursor.execute("""
+                    SELECT
+                        id, file_name, file_category,
+                        mime_type, file_size, storage_key,
+                        checksum, description, created_at, updated_at
+                    FROM mg_storage_objects
+                    WHERE user_id = %s
+                    AND deleted_at IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "files": [storage_row(row) for row in rows],
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@app.patch("/api/v1/storage/files/{file_id}")
+def update_storage_object(
+    file_id: str,
+    data: StorageUpdateRequest,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = storage_user_id(user)
+
+    try:
+        parsed_id = str(storage_uuid_lib.UUID(file_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file ID"
+        )
+
+    updates = data.model_dump(exclude_unset=True)
+
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail="No changes supplied"
+        )
+
+    if "file_name" in updates and updates["file_name"] is not None:
+        updates["file_name"] = storage_validate_name(
+            updates["file_name"]
+        )
+
+    if "description" in updates and updates["description"] is not None:
+        updates["description"] = updates["description"].strip()
+
+    assignments = []
+    params = []
+
+    for key in ("file_name", "description"):
+        if key in updates:
+            assignments.append(key + " = %s")
+            params.append(updates[key])
+
+    if not assignments:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid changes supplied"
+        )
+
+    assignments.append("updated_at = NOW()")
+
+    params.extend([parsed_id, user_id])
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg_storage_objects
+                SET """ + ", ".join(assignments) + """
+                WHERE id = %s
+                AND user_id = %s
+                AND deleted_at IS NULL
+                RETURNING
+                    id, file_name, file_category,
+                    mime_type, file_size, storage_key,
+                    checksum, description, created_at, updated_at
+            """, tuple(params))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
+    return {
+        "success": True,
+        "file": storage_row(row)
+    }
+
+
+@app.delete("/api/v1/storage/files/{file_id}")
+def delete_storage_object(
+    file_id: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = storage_user_id(user)
+
+    try:
+        parsed_id = str(storage_uuid_lib.UUID(file_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file ID"
+        )
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+            cursor.execute("""
+                UPDATE mg_storage_objects
+                SET deleted_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                AND user_id = %s
+                AND deleted_at IS NULL
+                RETURNING id
+            """, (parsed_id, user_id))
+
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
+    return {
+        "success": True,
+        "file_id": parsed_id,
+        "deleted": True
+    }
+
+
+@app.get("/api/v1/storage/statistics")
+def get_storage_statistics(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+    user_id = storage_user_id(user)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            storage_require_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*),
+                    COALESCE(SUM(file_size), 0),
+                    COUNT(*) FILTER (
+                        WHERE file_category = 'image'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE file_category = 'video'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE file_category = 'audio'
+                    ),
+                    COUNT(*) FILTER (
+                        WHERE file_category = 'document'
+                    )
+                FROM mg_storage_objects
+                WHERE user_id = %s
+                AND deleted_at IS NULL
+            """, (user_id,))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "statistics": {
+            "file_count": row[0],
+            "total_bytes": row[1],
+            "image_count": row[2],
+            "video_count": row[3],
+            "audio_count": row[4],
+            "document_count": row[5]
+        }
+    }
+
+
+# END OF SECTION 13
