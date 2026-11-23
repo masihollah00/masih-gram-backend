@@ -1946,3 +1946,560 @@ def delete_social_comment(
 # END MODULE 02
 # NEXT: FOLLOW SYSTEM + PROFILES + CREATOR BADGE
 # =========================================================
+
+# =========================================================
+# MODULE 03: GLOBAL IDENTITY + FOLLOW GRAPH
+# =========================================================
+
+# ---------------------------------------------------------
+# FOLLOW USER
+# ---------------------------------------------------------
+
+@app.post("/api/v1/social/follow/{target_user_id}")
+def follow_user(
+    target_user_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    if str(target_user_id) == user["id"]:
+        raise HTTPException(
+            status_code=422,
+            detail="You cannot follow yourself"
+        )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, account_status
+                FROM public.mg_users
+                WHERE id = %s AND deleted_at IS NULL
+            """, (target_user_id,))
+
+            target = cursor.fetchone()
+
+            if not target or target[1] != "active":
+                raise HTTPException(
+                    status_code=404,
+                    detail="User not found"
+                )
+
+            cursor.execute("""
+                INSERT INTO public.mg_social_follows(
+                    follower_id, following_id
+                )
+                VALUES (%s,%s)
+                ON CONFLICT(follower_id, following_id) DO NOTHING
+                RETURNING id
+            """, (user["id"], target_user_id))
+
+            inserted = cursor.fetchone()
+
+            if inserted:
+                create_global_notification(
+                    cursor,
+                    target_user_id,
+                    "new_follower",
+                    "دنبال‌کننده جدید",
+                    f"{user['display_name']} شما را دنبال کرد",
+                    user["id"],
+                    "user",
+                    uuid.UUID(user["id"])
+                )
+
+                global_audit(
+                    cursor,
+                    user["id"],
+                    "social.follow",
+                    "user",
+                    target_user_id
+                )
+
+    return {
+        "success": True,
+        "following": True,
+        "already_following": inserted is None
+    }
+
+
+# ---------------------------------------------------------
+# UNFOLLOW USER
+# ---------------------------------------------------------
+
+@app.delete("/api/v1/social/follow/{target_user_id}")
+def unfollow_user(
+    target_user_id: uuid.UUID,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                DELETE FROM public.mg_social_follows
+                WHERE follower_id = %s
+                  AND following_id = %s
+                RETURNING id
+            """, (user["id"], target_user_id))
+
+            removed = cursor.fetchone()
+
+    return {
+        "success": True,
+        "following": False,
+        "removed": removed is not None
+    }
+
+
+# ---------------------------------------------------------
+# FOLLOWERS
+# ---------------------------------------------------------
+
+@app.get("/api/v1/social/users/{target_user_id}/followers")
+def get_followers(
+    target_user_id: uuid.UUID,
+    limit: int = 30,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_users
+                WHERE id = %s AND deleted_at IS NULL
+            """, (target_user_id,))
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="User not found")
+
+            cursor.execute("""
+                SELECT
+                    u.id,
+                    u.username,
+                    u.display_name,
+                    f.created_at,
+                    EXISTS(
+                        SELECT 1
+                        FROM public.mg_social_follows mine
+                        WHERE mine.follower_id = %s
+                          AND mine.following_id = u.id
+                    )
+                FROM public.mg_social_follows f
+                JOIN public.mg_users u ON u.id = f.follower_id
+                WHERE f.following_id = %s
+                  AND u.account_status = 'active'
+                  AND u.deleted_at IS NULL
+                ORDER BY f.created_at DESC
+                LIMIT %s OFFSET %s
+            """, (user["id"], target_user_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "users": [
+            {
+                "id": str(r[0]),
+                "username": r[1],
+                "display_name": r[2],
+                "followed_at": r[3].isoformat(),
+                "following_me": bool(r[4])
+            }
+            for r in rows
+        ]
+    }
+
+
+# ---------------------------------------------------------
+# FOLLOWING
+# ---------------------------------------------------------
+
+@app.get("/api/v1/social/users/{target_user_id}/following")
+def get_following(
+    target_user_id: uuid.UUID,
+    limit: int = 30,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_users
+                WHERE id = %s AND deleted_at IS NULL
+            """, (target_user_id,))
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="User not found")
+
+            cursor.execute("""
+                SELECT
+                    u.id,
+                    u.username,
+                    u.display_name,
+                    f.created_at,
+                    EXISTS(
+                        SELECT 1
+                        FROM public.mg_social_follows mine
+                        WHERE mine.follower_id = %s
+                          AND mine.following_id = u.id
+                    )
+                FROM public.mg_social_follows f
+                JOIN public.mg_users u ON u.id = f.following_id
+                WHERE f.follower_id = %s
+                  AND u.account_status = 'active'
+                  AND u.deleted_at IS NULL
+                ORDER BY f.created_at DESC
+                LIMIT %s OFFSET %s
+            """, (user["id"], target_user_id, limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "users": [
+            {
+                "id": str(r[0]),
+                "username": r[1],
+                "display_name": r[2],
+                "followed_at": r[3].isoformat(),
+                "following_me": bool(r[4])
+            }
+            for r in rows
+        ]
+    }
+
+
+# ---------------------------------------------------------
+# PROFILE UPDATE
+# ---------------------------------------------------------
+
+@app.patch("/api/v1/profile/me")
+def update_my_profile(
+    data: GlobalProfileUpdate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    updates = data.model_dump(exclude_unset=True)
+
+    if not updates:
+        raise HTTPException(
+            status_code=422,
+            detail="No profile fields supplied"
+        )
+
+    for field in ("avatar_url", "cover_url"):
+        value = updates.get(field)
+        if value and not value.startswith(("https://", "http://")):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {field}"
+            )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                INSERT INTO public.mg_user_profiles(user_id)
+                VALUES (%s)
+                ON CONFLICT(user_id) DO NOTHING
+            """, (user["id"],))
+
+            allowed = {
+                "bio": "bio",
+                "avatar_url": "avatar_url",
+                "cover_url": "cover_url"
+            }
+
+            profile_updates = {
+                key: value
+                for key, value in updates.items()
+                if key in allowed
+            }
+
+            if profile_updates:
+                assignments = []
+                values = []
+
+                for key, value in profile_updates.items():
+                    assignments.append(f"{allowed[key]} = %s")
+                    values.append(value)
+
+                values.append(user["id"])
+
+                cursor.execute(
+                    "UPDATE public.mg_user_profiles SET "
+                    + ", ".join(assignments)
+                    + ", updated_at = NOW() WHERE user_id = %s",
+                    tuple(values)
+                )
+
+            if updates.get("display_name") is not None:
+                cursor.execute("""
+                    UPDATE public.mg_users
+                    SET display_name = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (
+                    updates["display_name"].strip(),
+                    user["id"]
+                ))
+
+            global_audit(
+                cursor,
+                user["id"],
+                "profile.update",
+                "user",
+                uuid.UUID(user["id"]),
+                {"fields": list(updates.keys())}
+            )
+
+    return {
+        "success": True,
+        "message": "Profile updated"
+    }
+
+
+# ---------------------------------------------------------
+# PUBLIC PROFILE
+# ---------------------------------------------------------
+
+@app.get("/api/v1/profile/{username}")
+def get_public_profile(
+    username: str,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT
+                    u.id,
+                    u.username,
+                    u.display_name,
+                    u.created_at,
+                    p.bio,
+                    p.avatar_url,
+                    p.cover_url,
+                    p.profile_visibility
+                FROM public.mg_users u
+                LEFT JOIN public.mg_user_profiles p
+                    ON p.user_id = u.id
+                WHERE LOWER(u.username) = LOWER(%s)
+                  AND u.account_status = 'active'
+                  AND u.deleted_at IS NULL
+            """, (username,))
+
+            row = cursor.fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            is_owner = str(row[0]) == user["id"]
+
+            if row[7] == "private" and not is_owner:
+                raise HTTPException(status_code=403, detail="Private profile")
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM public.mg_social_follows
+                WHERE following_id = %s
+            """, (row[0],))
+            followers = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM public.mg_social_follows
+                WHERE follower_id = %s
+            """, (row[0],))
+            following = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM public.mg_social_posts
+                WHERE user_id = %s AND is_deleted = FALSE
+            """, (row[0],))
+            posts = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM public.mg_social_follows
+                    WHERE follower_id = %s AND following_id = %s
+                )
+            """, (user["id"], row[0]))
+            is_following = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT badge_name
+                FROM public.mg_creator_badges
+                WHERE user_id = %s AND revoked_at IS NULL
+            """, (row[0],))
+            badge = cursor.fetchone()
+
+    return {
+        "success": True,
+        "profile": {
+            "id": str(row[0]),
+            "username": row[1],
+            "display_name": row[2],
+            "joined_at": row[3].isoformat(),
+            "bio": row[4],
+            "avatar_url": row[5],
+            "cover_url": row[6],
+            "followers_count": followers,
+            "following_count": following,
+            "posts_count": posts,
+            "is_following": bool(is_following),
+            "creator_badge": badge[0] if badge else None
+        }
+    }
+
+
+# ---------------------------------------------------------
+# MY CREATOR BADGE
+# ---------------------------------------------------------
+
+@app.get("/api/v1/creator-badge/me")
+def my_creator_badge(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = global_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT badge_name, granted_at
+                FROM public.mg_creator_badges
+                WHERE user_id = %s AND revoked_at IS NULL
+            """, (user["id"],))
+
+            row = cursor.fetchone()
+
+    return {
+        "success": True,
+        "has_badge": row is not None,
+        "badge": {
+            "name": row[0],
+            "granted_at": row[1].isoformat()
+        } if row else None
+    }
+
+
+# ---------------------------------------------------------
+# ADMIN: GRANT CREATOR BADGE
+# ---------------------------------------------------------
+
+@app.post("/api/v1/admin/users/{target_user_id}/creator-badge")
+def admin_grant_creator_badge(
+    target_user_id: uuid.UUID,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    verify_admin_key(x_admin_key)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id FROM public.mg_users
+                WHERE id = %s AND deleted_at IS NULL
+            """, (target_user_id,))
+
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="User not found")
+
+            cursor.execute("""
+                INSERT INTO public.mg_creator_badges(
+                    user_id, badge_name
+                )
+                VALUES (%s, 'سازنده MASIH GRAM')
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    badge_name = EXCLUDED.badge_name,
+                    granted_at = NOW(),
+                    revoked_at = NULL
+                RETURNING id
+            """, (target_user_id,))
+
+            badge_id = cursor.fetchone()[0]
+
+            global_audit(
+                cursor,
+                None,
+                "admin.creator_badge.grant",
+                "user",
+                target_user_id
+            )
+
+    return {
+        "success": True,
+        "badge_id": str(badge_id),
+        "badge": "سازنده MASIH GRAM"
+    }
+
+
+# ---------------------------------------------------------
+# ADMIN: REVOKE CREATOR BADGE
+# ---------------------------------------------------------
+
+@app.delete("/api/v1/admin/users/{target_user_id}/creator-badge")
+def admin_revoke_creator_badge(
+    target_user_id: uuid.UUID,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    verify_admin_key(x_admin_key)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_creator_badges
+                SET revoked_at = NOW()
+                WHERE user_id = %s AND revoked_at IS NULL
+            """, (target_user_id,))
+
+            changed = cursor.rowcount
+
+            global_audit(
+                cursor,
+                None,
+                "admin.creator_badge.revoke",
+                "user",
+                target_user_id
+            )
+
+    return {
+        "success": True,
+        "revoked": bool(changed)
+    }
+
+
+# =========================================================
+# END MODULE 03
+# NEXT: FEATURE STORE + ADMIN CONTROL CENTER
+# =========================================================
