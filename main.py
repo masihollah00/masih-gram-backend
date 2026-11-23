@@ -3231,3 +3231,557 @@ def global_admin_revoke_user_feature(
 # END OF SECTION 4
 # NEXT: SECTION 5 — NOTIFICATIONS + REPORTS + USER SAFETY
 # =========================================================
+# =========================================================
+# MASIH GRAM GLOBAL — SECTION 5
+# NOTIFICATION ENGINE + TRUST & SAFETY + MODERATION CENTER
+# =========================================================
+
+# ---------------------------------------------------------
+# 5.1 — NOTIFICATION SERIALIZER
+# ---------------------------------------------------------
+
+def global_notification_dict(row):
+    return {
+        "id": str(row[0]),
+        "type": row[1],
+        "title": row[2],
+        "body": row[3],
+        "is_read": bool(row[4]),
+        "created_at": row[5].isoformat() if row[5] else None
+    }
+
+
+def global_report_dict(row):
+    return {
+        "id": str(row[0]),
+        "target_type": row[1],
+        "target_id": str(row[2]),
+        "reason": row[3],
+        "status": row[4],
+        "created_at": row[5].isoformat() if row[5] else None
+    }
+
+
+# ---------------------------------------------------------
+# 5.2 — NOTIFICATION INBOX
+# ---------------------------------------------------------
+
+@app.get("/api/v1/notifications")
+def global_get_notifications(
+    unread_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, min(offset, 100000))
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            if unread_only:
+                cursor.execute("""
+                    SELECT id, notification_type, title, body,
+                           is_read, created_at
+                    FROM public.mg_global_notifications
+                    WHERE user_id = %s
+                      AND is_read = FALSE
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user["id"], limit, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, notification_type, title, body,
+                           is_read, created_at
+                    FROM public.mg_global_notifications
+                    WHERE user_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (user["id"], limit, offset))
+
+            rows = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM public.mg_global_notifications
+                WHERE user_id = %s AND is_read = FALSE
+            """, (user["id"],))
+
+            unread_count = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "unread_count": unread_count,
+        "count": len(rows),
+        "notifications": [
+            global_notification_dict(row) for row in rows
+        ],
+        "pagination": {
+            "limit": limit,
+            "offset": offset
+        }
+    }
+
+
+@app.get("/api/v1/notifications/unread-count")
+def global_notification_unread_count(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM public.mg_global_notifications
+                WHERE user_id = %s
+                  AND is_read = FALSE
+            """, (user["id"],))
+
+            count = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "unread_count": count
+    }
+
+
+# ---------------------------------------------------------
+# 5.3 — MARK NOTIFICATIONS AS READ
+# ---------------------------------------------------------
+
+@app.post("/api/v1/notifications/read")
+def global_mark_notifications_read(
+    data: GlobalNotificationRead,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    if not data.notification_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one notification ID is required"
+        )
+
+    if len(data.notification_ids) > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Maximum 100 notification IDs per request"
+        )
+
+    notification_ids = []
+
+    for value in data.notification_ids:
+        try:
+            notification_ids.append(uuid.UUID(str(value)))
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="One or more notification IDs are invalid"
+            )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_global_notifications
+                SET is_read = TRUE
+                WHERE user_id = %s
+                  AND id = ANY(%s)
+                  AND is_read = FALSE
+                RETURNING id
+            """, (user["id"], notification_ids))
+
+            updated_count = len(cursor.fetchall())
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM public.mg_global_notifications
+                WHERE user_id = %s
+                  AND is_read = FALSE
+            """, (user["id"],))
+
+            unread_count = cursor.fetchone()[0]
+
+    return {
+        "success": True,
+        "updated_count": updated_count,
+        "unread_count": unread_count
+    }
+
+
+@app.post("/api/v1/notifications/read-all")
+def global_mark_all_notifications_read(
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                UPDATE public.mg_global_notifications
+                SET is_read = TRUE
+                WHERE user_id = %s
+                  AND is_read = FALSE
+                RETURNING id
+            """, (user["id"],))
+
+            updated_count = len(cursor.fetchall())
+
+    return {
+        "success": True,
+        "updated_count": updated_count,
+        "unread_count": 0
+    }
+
+
+# ---------------------------------------------------------
+# 5.4 — REPORT CONTENT
+# ---------------------------------------------------------
+
+@app.post("/api/v1/reports")
+def global_create_report(
+    data: GlobalReportCreate,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    target_type = data.target_type.strip().lower()
+    reason = data.reason.strip()
+
+    if target_type not in ("post", "comment", "profile"):
+        raise HTTPException(
+            status_code=422,
+            detail="Unsupported report target type"
+        )
+
+    if len(reason) < 5 or len(reason) > 1500:
+        raise HTTPException(
+            status_code=422,
+            detail="Report reason must contain 5 to 1500 characters"
+        )
+
+    try:
+        target_uuid = uuid.UUID(str(data.target_id))
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid target ID"
+        )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            if target_type == "post":
+                cursor.execute("""
+                    SELECT id, user_id
+                    FROM public.mg_social_posts
+                    WHERE id = %s
+                      AND deleted_at IS NULL
+                """, (target_uuid,))
+                target = cursor.fetchone()
+
+            elif target_type == "comment":
+                cursor.execute("""
+                    SELECT id, user_id
+                    FROM public.mg_social_comments
+                    WHERE id = %s
+                      AND deleted_at IS NULL
+                """, (target_uuid,))
+                target = cursor.fetchone()
+
+            else:
+                cursor.execute("""
+                    SELECT id
+                    FROM public.mg_users
+                    WHERE id = %s
+                      AND deleted_at IS NULL
+                """, (target_uuid,))
+                target = cursor.fetchone()
+
+            if not target:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Reported content was not found"
+                )
+
+            target_owner_id = str(target[1]) if target_type != "profile" else str(target[0])
+
+            if target_owner_id == user["id"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail="You cannot report your own content"
+                )
+
+            cursor.execute("""
+                SELECT id
+                FROM public.mg_social_reports
+                WHERE reporter_id = %s
+                  AND target_type = %s
+                  AND target_id = %s
+                  AND status = 'pending'
+                LIMIT 1
+            """, (user["id"], target_type, target_uuid))
+
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail="You already submitted a pending report for this content"
+                )
+
+            cursor.execute("""
+                INSERT INTO public.mg_social_reports
+                    (reporter_id, target_type, target_id,
+                     reason, status, created_at)
+                VALUES (%s, %s, %s, %s, 'pending', NOW())
+                RETURNING id, created_at
+            """, (
+                user["id"],
+                target_type,
+                target_uuid,
+                reason
+            ))
+
+            report_row = cursor.fetchone()
+
+            global_audit(
+                cursor,
+                user["id"],
+                "content_report_created",
+                target_type,
+                str(target_uuid),
+                {"report_id": str(report_row[0])}
+            )
+
+    return {
+        "success": True,
+        "message": "گزارش شما برای بررسی ثبت شد",
+        "report": {
+            "id": str(report_row[0]),
+            "target_type": target_type,
+            "target_id": str(target_uuid),
+            "status": "pending",
+            "created_at": report_row[1].isoformat()
+        }
+    }
+
+
+# ---------------------------------------------------------
+# 5.5 — USER REPORT HISTORY
+# ---------------------------------------------------------
+
+@app.get("/api/v1/reports/me")
+def global_my_reports(
+    limit: int = 50,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    user = get_authenticated_user(authorization)
+
+    limit = max(1, min(limit, 100))
+    offset = max(0, min(offset, 100000))
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, target_type, target_id,
+                       reason, status, created_at
+                FROM public.mg_social_reports
+                WHERE reporter_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+            """, (user["id"], limit, offset))
+
+            rows = cursor.fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "reports": [global_report_dict(row) for row in rows]
+    }
+
+
+# ---------------------------------------------------------
+# 5.6 — ADMIN MODERATION QUEUE
+# ---------------------------------------------------------
+
+@app.get("/api/v1/admin/moderation/reports")
+def global_admin_moderation_queue(
+    status: Optional[str] = "pending",
+    limit: int = 100,
+    offset: int = 0,
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    allowed_statuses = {
+        "pending",
+        "reviewed",
+        "dismissed",
+        "action_taken"
+    }
+
+    if status and status not in allowed_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid moderation status"
+        )
+
+    limit = max(1, min(limit, 300))
+    offset = max(0, min(offset, 100000))
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            if status:
+                cursor.execute("""
+                    SELECT id, reporter_id, target_type, target_id,
+                           reason, status, created_at
+                    FROM public.mg_social_reports
+                    WHERE status = %s
+                    ORDER BY created_at ASC
+                    LIMIT %s OFFSET %s
+                """, (status, limit, offset))
+            else:
+                cursor.execute("""
+                    SELECT id, reporter_id, target_type, target_id,
+                           reason, status, created_at
+                    FROM public.mg_social_reports
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (limit, offset))
+
+            rows = cursor.fetchall()
+
+    reports = []
+
+    for row in rows:
+        reports.append({
+            "id": str(row[0]),
+            "reporter_id": str(row[1]),
+            "target_type": row[2],
+            "target_id": str(row[3]),
+            "reason": row[4],
+            "status": row[5],
+            "created_at": row[6].isoformat() if row[6] else None
+        })
+
+    return {
+        "success": True,
+        "count": len(reports),
+        "reports": reports
+    }
+
+
+# ---------------------------------------------------------
+# 5.7 — ADMIN REPORT DECISION
+# ---------------------------------------------------------
+
+@app.post("/api/v1/admin/moderation/reports/{report_id}/decision")
+def global_admin_report_decision(
+    report_id: str,
+    decision: str,
+    admin_note: str = "",
+    x_admin_key: Optional[str] = Header(default=None)
+):
+    global_admin_check(x_admin_key)
+
+    try:
+        report_uuid = uuid.UUID(report_id)
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid report ID"
+        )
+
+    decision = decision.strip().lower()
+    admin_note = admin_note.strip()
+
+    if decision not in ("reviewed", "dismissed", "action_taken"):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid moderation decision"
+        )
+
+    if len(admin_note) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail="Admin note is too long"
+        )
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            require_global_schema(cursor)
+
+            cursor.execute("""
+                SELECT id, reporter_id, target_type, target_id, status
+                FROM public.mg_social_reports
+                WHERE id = %s
+                FOR UPDATE
+            """, (report_uuid,))
+
+            report = cursor.fetchone()
+
+            if not report:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Report not found"
+                )
+
+            if report[4] != "pending":
+                raise HTTPException(
+                    status_code=409,
+                    detail="This report has already been processed"
+                )
+
+            cursor.execute("""
+                UPDATE public.mg_social_reports
+                SET status = %s,
+                    admin_note = %s,
+                    reviewed_at = NOW()
+                WHERE id = %s
+            """, (decision, admin_note, report_uuid))
+
+            global_audit(
+                cursor,
+                None,
+                "moderation_report_decision",
+                report[2],
+                str(report[3]),
+                {
+                    "report_id": str(report_uuid),
+                    "decision": decision
+                }
+            )
+
+            create_global_notification(
+                cursor,
+                str(report[1]),
+                "report_reviewed",
+                "گزارش شما بررسی شد",
+                "گزارش ثبت‌شده شما توسط مدیریت بررسی شد"
+            )
+
+    return {
+        "success": True,
+        "report_id": str(report_uuid),
+        "decision": decision
+    }
+
+
+# =========================================================
+# END OF SECTION 5
+# NEXT: SECTION 6 — SEARCH + DISCOVERY + GLOBAL DIRECTORY
+# =========================================================
