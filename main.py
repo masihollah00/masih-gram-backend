@@ -827,7 +827,13 @@ def verify_otp(data: OTPVerify, request: Request):
                     detail="Verification code is invalid or expired"
                 )
 
-            challenge_id, stored_hash, attempts, max_attempts = challenge
+            # HybridRow is dict-compatible; iterating it yields column names,
+            # not values. Read the selected columns explicitly to avoid passing
+            # the literal string "id" into UUID parameters.
+            challenge_id = challenge["id"]
+            stored_hash = challenge["code_hash"]
+            attempts = challenge["attempts"]
+            max_attempts = challenge["max_attempts"]
 
             if attempts >= max_attempts:
                 raise HTTPException(
@@ -9662,7 +9668,9 @@ def activity_summary(
                 WHERE user_id = %s
             """, (user_id,))
 
-            total, latest = cursor.fetchone()
+            activity_summary = cursor.fetchone()
+            total = activity_summary[0]
+            latest = activity_summary[1]
 
     event_counts = {
         row[0]: row[1]
